@@ -1,0 +1,42 @@
+appId: me.cita777.metapi.desktop
+productName: Metapi
+artifactName: ${name}-${version}-${os}-${arch}.${ext}
+directories:
+  output: release
+electronDist: node_modules/electron/dist
+icon: build/desktop-icon.png
+asar: false
+files:
+  - dist/**/*
+  - drizzle/**/*
+  - package.json
+mac:
+  target:
+    - dmg
+    - zip
+  category: public.app-category.developer-tools
+  hardenedRuntime: false
+  gatekeeperAssess: false
+  entitlementsInherit: null
+win:
+  target:
+    - nsis
+    - zip
+linux:
+  target:
+    - AppImage
+    - deb
+    - rpm
+  maintainer: cita-777 <cita-777@users.noreply.github.com>
+publish:
+  provider: github
+  owner: cita-777
+  repo: metapi
+  releaseType: release
+  publishAutoUpdate: true
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+afterPack: scripts/desktop/afterPack.mjs
+afterSign: scripts/desktop/afterSign.mjs

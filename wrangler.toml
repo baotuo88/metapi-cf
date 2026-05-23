@@ -1,0 +1,19 @@
+name = "metapi-cloudflare"
+main = "src/cloudflare/worker.ts"
+compatibility_date = "2026-05-21"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+ENVIRONMENT = "development"
+
+[[d1_databases]]
+binding = "METAPI_DB"
+database_name = "metapi"
+database_id = "00000000-0000-0000-0000-000000000000"
+
+[[r2_buckets]]
+binding = "METAPI_FILES"
+bucket_name = "metapi-files"
+
+[triggers]
+crons = []

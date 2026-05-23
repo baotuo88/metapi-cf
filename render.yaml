@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: metapi
+    runtime: docker
+    repo: https://github.com/cita-777/metapi
+    dockerfilePath: ./docker/Dockerfile
+    dockerContext: .
+    plan: free
+    envVars:
+      - key: AUTH_TOKEN
+        sync: false
+      - key: PROXY_TOKEN
+        sync: false
+      - key: TZ
+        value: Asia/Shanghai
+      - key: PORT
+        value: "4000"
+      - key: DATA_DIR
+        value: /app/data
+      - key: NODE_ENV
+        value: production
+      - key: DB_TYPE
+        value: mysql
+      - key: DB_URL
+        sync: false
+      - key: DB_SSL
+        value: "true"
+      - key: CHECKIN_CRON
+        value: "0 8 * * *"
+      - key: BALANCE_REFRESH_CRON
+        value: "0 * * * *"

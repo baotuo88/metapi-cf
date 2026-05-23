@@ -1,0 +1,29 @@
+node_modules/
+dist/
+release/
+data/*
+!data/.gitkeep
+.env
+*.log
+*.tar.gz
+logs/
+tmp/*
+!tmp/.gitkeep
+.worktrees/
+.wrangler/
+
+# Local desktop/debug artifacts
+/.tmp-*
+/main.js
+/NUL
+/.playwright-cli/
+
+.DS_Store
+Thumbs.db
+docker/data/
+docker/.env
+
+# Local planning docs
+docs/plan/
+docs/plans/
+.ace-tool/
