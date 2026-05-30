@@ -15,7 +15,7 @@ ENVIRONMENT = "development"
 [[d1_databases]]
 binding = "METAPI_DB"
 database_name = "metapi"
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "12f3fa4a-c016-40f2-86c9-cf00d076f79e"
 
 [[r2_buckets]]
 binding = "METAPI_FILES"
