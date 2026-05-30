@@ -1,4 +1,4 @@
-﻿import React, { Suspense, lazy, useState, useEffect, useRef } from 'react';
+﻿import React, { Suspense, lazy, useMemo, useState, useEffect, useRef } from 'react';
 import { Routes, Route, NavLink, Navigate, useLocation } from 'react-router-dom';
 import { ToastProvider, useToast } from './components/Toast.js';
 import SearchModal from './components/SearchModal.js';
@@ -437,6 +437,16 @@ const topNavItems = [
   { label: '关于', to: '/about' },
 ];
 
+const CLOUDFLARE_SUPPORTED_SIDEBAR_PATHS = new Set([
+  '/',
+  '/events',
+]);
+
+const CLOUDFLARE_SUPPORTED_TOP_NAV_PATHS = new Set([
+  '/',
+  '/about',
+]);
+
 function PageTransition({ children }: { children: React.ReactNode }) {
   const location = useLocation();
   return <div key={location.pathname} className="page-enter">{children}</div>;
@@ -454,6 +464,7 @@ function RouteLoadingFallback() {
 function AppShell() {
   const { language, toggleLanguage, t } = useI18n();
   const [authed, setAuthed] = useState(() => hasValidAuthSession(localStorage));
+  const [isCloudflareRuntime, setIsCloudflareRuntime] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [showUserMenu, setShowUserMenu] = useState(false);
   const userMenuRef = useRef<HTMLDivElement>(null);
@@ -480,6 +491,39 @@ function AppShell() {
   const displayName = rawDisplayName ? (rawDisplayName === '管理员' ? t('管理员') : rawDisplayName) : t('管理员');
   const resolvedThemeLabel = resolvedTheme === 'dark' ? t('深色') : t('浅色');
   const avatarUrl = buildDicebearAvatarUrl(userProfile.avatarStyle, userProfile.avatarSeed);
+  const visibleSidebarGroups = useMemo(() => {
+    if (!isCloudflareRuntime) return sidebarGroups;
+    return sidebarGroups
+      .map((group) => ({
+        ...group,
+        items: group.items.filter((item) => CLOUDFLARE_SUPPORTED_SIDEBAR_PATHS.has(item.to)),
+      }))
+      .filter((group) => group.items.length > 0);
+  }, [isCloudflareRuntime]);
+  const visibleTopNavItems = useMemo(() => {
+    if (!isCloudflareRuntime) return topNavItems;
+    return topNavItems.filter((item) => CLOUDFLARE_SUPPORTED_TOP_NAV_PATHS.has(item.to));
+  }, [isCloudflareRuntime]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const detectCloudflareRuntime = async () => {
+      try {
+        const response = await fetch('/api/cloudflare/health');
+        if (!response.ok) return;
+        const payload = await response.json() as { runtime?: string };
+        if (!cancelled && payload.runtime === 'cloudflare-worker') {
+          setIsCloudflareRuntime(true);
+        }
+      } catch {
+        // ignore runtime detection errors
+      }
+    };
+
+    void detectCloudflareRuntime();
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     const media = window.matchMedia('(prefers-color-scheme: dark)');
@@ -662,7 +706,7 @@ function AppShell() {
           <span className="topbar-logo-text">Metapi</span>
         </div>
         <nav className="topbar-nav">
-          {topNavItems.map((item) => (
+          {visibleTopNavItems.map((item) => (
             <NavLink key={item.to} to={item.to} end className={({ isActive }) => `topbar-nav-item ${isActive ? 'active' : ''}`}>
               {t(item.label)}
             </NavLink>
@@ -794,7 +838,7 @@ function AppShell() {
               <span>Metapi</span>
             </div>
             <nav className="mobile-nav">
-              {sidebarGroups.map((group) => (
+              {visibleSidebarGroups.map((group) => (
                 <div key={group.label} className="mobile-nav-group">
                   <div className="mobile-nav-label">{t(group.label)}</div>
                   {group.items.map((item) => (
@@ -811,6 +855,7 @@ function AppShell() {
                   ))}
                 </div>
               ))}
+              {!isCloudflareRuntime && (
               <div className="mobile-nav-group">
                 <div className="mobile-nav-label">{t('更多')}</div>
                 {topNavItems.filter((n) => n.to !== '/').map((item) => (
@@ -824,11 +869,12 @@ function AppShell() {
                   </NavLink>
                 ))}
               </div>
+              )}
             </nav>
           </MobileDrawer>
         ) : (
           <aside className={`sidebar ${sidebarCollapsed ? 'collapsed' : ''}`}>
-            {sidebarGroups.map((group) => (
+            {visibleSidebarGroups.map((group) => (
               <div key={group.label} className="sidebar-group">
                 {!sidebarCollapsed && <div className="sidebar-group-label">{t(group.label)}</div>}
                 {group.items.map((item) => (
@@ -860,23 +906,27 @@ function AppShell() {
             <Suspense fallback={<RouteLoadingFallback />}>
               <Routes>
                 <Route path="/" element={<Dashboard adminName={displayName} />} />
-                <Route path="/sites" element={<Sites />} />
-                <Route path="/site-announcements" element={<SiteAnnouncements />} />
-                <Route path="/accounts" element={<Accounts />} />
-                <Route path="/oauth" element={<OAuthManagement />} />
-                <Route path="/tokens" element={<Tokens />} />
-                <Route path="/checkin" element={<CheckinLog />} />
-                <Route path="/routes" element={<TokenRoutes />} />
-                <Route path="/logs" element={<ProxyLogs />} />
-                <Route path="/monitor" element={<Monitors />} />
-                <Route path="/settings" element={<Settings />} />
-                <Route path="/downstream-keys" element={<DownstreamKeys />} />
                 <Route path="/events" element={<ProgramLogs />} />
-                <Route path="/settings/import-export" element={<ImportExport />} />
-                <Route path="/settings/notify" element={<NotificationSettings />} />
-                <Route path="/models" element={<Models />} />
-                <Route path="/playground" element={<ModelTester />} />
                 <Route path="/about" element={<About />} />
+                {!isCloudflareRuntime && (
+                  <>
+                    <Route path="/sites" element={<Sites />} />
+                    <Route path="/site-announcements" element={<SiteAnnouncements />} />
+                    <Route path="/accounts" element={<Accounts />} />
+                    <Route path="/oauth" element={<OAuthManagement />} />
+                    <Route path="/tokens" element={<Tokens />} />
+                    <Route path="/checkin" element={<CheckinLog />} />
+                    <Route path="/routes" element={<TokenRoutes />} />
+                    <Route path="/logs" element={<ProxyLogs />} />
+                    <Route path="/monitor" element={<Monitors />} />
+                    <Route path="/settings" element={<Settings />} />
+                    <Route path="/downstream-keys" element={<DownstreamKeys />} />
+                    <Route path="/settings/import-export" element={<ImportExport />} />
+                    <Route path="/settings/notify" element={<NotificationSettings />} />
+                    <Route path="/models" element={<Models />} />
+                    <Route path="/playground" element={<ModelTester />} />
+                  </>
+                )}
                 <Route path="*" element={<Navigate to="/" />} />
               </Routes>
             </Suspense>
