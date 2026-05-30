@@ -1,7 +1,13 @@
 name = "metapi-cloudflare"
 main = "src/cloudflare/worker.ts"
-compatibility_date = "2026-05-21"
+compatibility_date = "2026-05-28"
 compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "dist/web"
+binding = "ASSETS"
+not_found_handling = "404-page"
+html_handling = "auto-trailing-slash"
 
 [vars]
 ENVIRONMENT = "development"
@@ -17,3 +23,6 @@ bucket_name = "metapi-files"
 
 [triggers]
 crons = []
+
+[observability]
+enabled = true

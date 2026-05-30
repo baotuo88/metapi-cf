@@ -17,6 +17,82 @@
 > - 当前不再提供 `Release` 压缩包 + Node.js 运行时的独立部署路径。
 > - 生产/长期运行请用 Docker 系列方案；桌面版面向单机本地使用；源码运行请走本地开发流程。
 
+## Cloudflare Workers 部署
+
+当前仓库已支持 Cloudflare Worker 运行时，可直接承载管理 API 与 `/v1/*` 代理入口。
+
+### 1) 初始化 Cloudflare 资源（推荐自动化）
+
+在本机 shell 导出 Cloudflare API Token：
+
+```bash
+export CLOUDFLARE_API_TOKEN=your-cloudflare-api-token
+```
+
+执行资源初始化：
+
+```bash
+npm run cf:provision
+```
+
+该命令会自动创建或复用：
+
+- D1 数据库（默认名 `metapi`）
+- R2 存储桶（默认名 `metapi-files`）
+
+并自动回写 `wrangler.toml` 中的绑定与 `database_id`。
+
+如需自定义名称：
+
+```bash
+npm run cf:provision -- --d1-name your-d1-name --r2-bucket your-r2-bucket
+```
+
+### 2) 设置发布所需环境变量
+
+在本机 shell 导出以下变量（不要写入 Git）：
+
+```bash
+export AUTH_TOKEN=your-admin-token
+export PROXY_TOKEN=your-proxy-sk-token
+```
+
+### 3) 一键发布（推荐）
+
+执行：
+
+```bash
+npm run cf:release:provision
+```
+
+该命令会依次执行：
+
+- `cf:provision`（自动创建/复用 D1 与 R2，并回写 `wrangler.toml`）
+- `cf:preflight`（配置与环境预检）
+- `build:cloudflare`
+- `wrangler secret put AUTH_TOKEN`
+- `wrangler secret put PROXY_TOKEN`
+- 远程 D1 初始化（`d1.bootstrap.sql`）
+- `wrangler deploy`
+
+### 4) 分步执行（可选）
+
+```bash
+npm run cf:provision
+npm run cf:preflight
+npm run build:cloudflare
+npm run cf:d1:init:remote
+npm run cf:deploy
+```
+
+### 5) 健康检查
+
+部署后可访问：
+
+- `GET /api/cloudflare/health`
+
+返回 `ok: true` 且 `bindings.d1/r2` 为 `true` 表示 Worker 绑定生效。
+
 ## K3s / Helm 更新中心
 
 如果你现在只是一个最普通的 Docker / Docker Compose 部署，请先跳过这节。

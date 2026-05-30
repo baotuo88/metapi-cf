@@ -1,24 +1,21 @@
 import { Hono } from 'hono';
-import { createD1Db } from './db/d1.js';
 import type { CloudflareEnv } from './env.js';
 import { settings } from '../server/db/schema.js';
+import { registerAuthRoutes } from './routes/auth.js';
+import { registerCoreApiRoutes } from './routes/api.js';
+import { registerProxyRoutes } from './routes/proxy.js';
+import {
+  getCloudflareDb,
+  isPublicCloudflareApiRoute,
+  jsonNotImplemented,
+  requireAdminAuth,
+  type CloudflareHonoEnv,
+} from './shared/http.js';
 
-type HonoBindings = {
-  Bindings: CloudflareEnv;
-};
-
-const app = new Hono<HonoBindings>();
-
-function jsonNotImplemented(feature: string) {
-  return {
-    error: 'not_implemented',
-    feature,
-    message: 'This Cloudflare Worker entry is a migration skeleton. The Fastify route has not been ported yet.',
-  };
-}
+const app = new Hono<CloudflareHonoEnv>();
 
 app.get('/api/cloudflare/health', async (c) => {
-  const db = createD1Db(c.env.METAPI_DB);
+  const db = getCloudflareDb(c);
   const settingsProbe = await db
     .select()
     .from(settings)
@@ -40,8 +37,21 @@ app.get('/api/cloudflare/health', async (c) => {
   });
 });
 
+app.use('/api/*', async (c, next) => {
+  if (isPublicCloudflareApiRoute(new URL(c.req.url).pathname)) {
+    await next();
+    return;
+  }
+  return requireAdminAuth(c, next);
+});
+
+// Mount the newly migrated active routes
+registerAuthRoutes(app);
+registerCoreApiRoutes(app);
+registerProxyRoutes(app);
+
+// Fallbacks for unported subsystems
 app.all('/api/*', (c) => c.json(jsonNotImplemented('api-routes'), 501));
-app.all('/v1/*', (c) => c.json(jsonNotImplemented('openai-compatible-proxy'), 501));
 app.all('/monitor-proxy/*', (c) => c.json(jsonNotImplemented('monitor-proxy'), 501));
 
 app.notFound((c) => c.json({

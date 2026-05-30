@@ -28,4 +28,13 @@ describe('Cloudflare runtime boundaries', () => {
     expect(combined).not.toMatch(/from ['"].*server\/routes\//);
     expect(combined).not.toMatch(/from ['"].*server\/services\//);
   });
+
+  it('keeps proxy routing inside cloudflare runtime modules', () => {
+    const proxyRouteSource = readFileSync(new URL('./routes/proxy.ts', import.meta.url), 'utf8');
+
+    expect(proxyRouteSource).not.toContain('https://api.openai.com');
+    expect(proxyRouteSource).not.toContain('redirect: \'follow\'');
+    expect(proxyRouteSource).toContain("from '../proxy/auth.js'");
+    expect(proxyRouteSource).toContain("from '../proxy/runtime.js'");
+  });
 });
