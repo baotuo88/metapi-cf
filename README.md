@@ -289,6 +289,30 @@
   <img alt="Deploy to Render" src="https://render.com/images/deploy-to-render-button.svg" height="28">
 </a>
 
+### Cloudflare Workers（网页部署）
+
+1. 在 Cloudflare 控制台 `Workers & Pages` 里导入本仓库（Git 集成）。
+2. Build command 填：`npm ci && npm run build:cloudflare`，Root directory 设为 `/`。
+3. 在项目 `Settings -> Variables and Secrets` 添加 Secrets：
+   - `AUTH_TOKEN`
+   - `PROXY_TOKEN`
+4. 在 `Settings -> Bindings` 添加：
+   - D1: `METAPI_DB`
+   - R2: `METAPI_FILES`
+5. 在 D1 控制台执行 [`src/server/db/generated/d1.bootstrap.sql`](./src/server/db/generated/d1.bootstrap.sql) 初始化表结构。
+6. 重新 Deploy 后访问 `GET /api/cloudflare/health`，确认 `bindings.d1/r2` 均为 `true`。
+
+如果你用本地命令自动化初始化+发布，可执行：
+
+```bash
+export CLOUDFLARE_API_TOKEN=your-cloudflare-api-token
+export AUTH_TOKEN=your-admin-token
+export PROXY_TOKEN=your-proxy-sk-token
+npm run cf:release:provision
+```
+
+完整步骤见：[部署指南（Cloudflare Workers）](https://metapi.cita777.me/deployment#cloudflare-workers-部署)
+
 ### Docker Compose（推荐）
 
 ```bash
