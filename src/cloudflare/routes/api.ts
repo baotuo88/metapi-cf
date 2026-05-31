@@ -5320,11 +5320,9 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
           ? 'openai'
           : 'new-api';
     return c.json({
-      success: true,
-      detected: {
-        platform,
-        name: platform.toUpperCase(),
-      },
+      url,
+      platform,
+      initializationPresetId: null,
     });
   });
 
