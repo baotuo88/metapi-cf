@@ -14,6 +14,11 @@ import {
   parseUpdateCenterDeployPayload,
   parseUpdateCenterRollbackPayload,
 } from '../../server/contracts/supportRoutePayloads.js';
+import {
+  parseBackupImportPayload,
+  parseBackupWebdavConfigPayload,
+  parseBackupWebdavExportPayload,
+} from '../../server/contracts/settingsRoutePayloads.js';
 
 type SiteAvailabilityBucket = {
   startUtc: string;
@@ -9275,7 +9280,11 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
 
   app.get('/api/settings/backup/export', async (c) => {
     const db = getCloudflareDb(c);
-    const type = String(c.req.query('type') || 'all').trim().toLowerCase();
+    const rawType = String(c.req.query('type') || 'all').trim().toLowerCase();
+    const type = rawType === 'accounts' || rawType === 'preferences' ? rawType : 'all';
+    if (rawType && !['all', 'accounts', 'preferences'].includes(rawType)) {
+      return c.json({ success: false, message: '导出类型无效，仅支持 all/accounts/preferences' }, 400);
+    }
     const [sites, accounts, accountTokens, routes, routeChannels, settingsRows] = await Promise.all([
       db.select().from(schema.sites).all(),
       db.select().from(schema.accounts).all(),
@@ -9301,8 +9310,11 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
 
   app.post('/api/settings/backup/import', async (c) => {
     const db = getCloudflareDb(c);
-    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
-    const root = safeJsonObject(body);
+    const parsedBody = parseBackupImportPayload(await c.req.json().catch(() => ({})));
+    if (!parsedBody.success) {
+      return c.json({ success: false, message: parsedBody.error }, 400);
+    }
+    const root = safeJsonObject(parsedBody.data);
     const data = safeJsonObject(root.data);
     const accountsSection = safeJsonObject(root.accounts);
     const preferencesSection = safeJsonObject(root.preferences);
@@ -9508,7 +9520,11 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
 
   app.put('/api/settings/backup/webdav', async (c) => {
     const db = getCloudflareDb(c);
-    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+    const parsedBody = parseBackupWebdavConfigPayload(await c.req.json().catch(() => ({})));
+    if (!parsedBody.success) {
+      return c.json({ success: false, message: parsedBody.error }, 400);
+    }
+    const body = parsedBody.data;
     const current = safeJsonObject(await readSetting(db, 'cloudflare_backup_webdav_config'));
     const next = {
       enabled: !!body.enabled,
@@ -9528,8 +9544,12 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
     });
   });
 
-  app.post('/api/settings/backup/webdav/export', async (_c) => {
-    return _c.json({
+  app.post('/api/settings/backup/webdav/export', async (c) => {
+    const parsedBody = parseBackupWebdavExportPayload(await c.req.json().catch(() => ({})));
+    if (!parsedBody.success) {
+      return c.json({ success: false, message: parsedBody.error }, 400);
+    }
+    return c.json({
       success: true,
       message: 'Cloudflare Worker 版本未接入 WebDAV，导出任务已模拟完成',
     });
