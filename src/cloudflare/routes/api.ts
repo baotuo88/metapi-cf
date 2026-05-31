@@ -5536,11 +5536,41 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
     if (!Number.isFinite(siteId) || siteId <= 0 || !accessToken) {
       return c.json({ success: false, message: 'siteId/accessToken 不能为空' }, 400);
     }
+    const credentialMode = String(body.credentialMode || '').trim().toLowerCase();
+    const looksLikeApiKey = /^sk-[A-Za-z0-9_\-]{4,}/.test(accessToken);
+    const tokenType = credentialMode === 'session'
+      ? 'session'
+      : credentialMode === 'apikey'
+        ? 'apikey'
+        : (looksLikeApiKey ? 'apikey' : 'session');
+
+    if (tokenType === 'session') {
+      const usernameFromBody = String(body.username || '').trim();
+      const platformUserId = Math.trunc(Number(body.platformUserId));
+      const normalizedUserId = Number.isFinite(platformUserId) && platformUserId > 0
+        ? String(platformUserId)
+        : null;
+      return c.json({
+        success: true,
+        tokenType: 'session',
+        userInfo: {
+          username: usernameFromBody || `session-${accessToken.slice(0, 8)}`,
+          ...(normalizedUserId ? { userId: normalizedUserId } : {}),
+        },
+        balance: {
+          balance: 0,
+        },
+        apiToken: null,
+        message: 'Session Token 验证通过（Cloudflare 本地校验）',
+      });
+    }
+
     return c.json({
       success: true,
-      valid: true,
-      message: 'Token 验证通过（Cloudflare 版本为本地校验）',
-      username: `verified-${accessToken.slice(0, 6)}`,
+      tokenType: 'apikey',
+      modelCount: 0,
+      models: [],
+      message: 'API Key 验证通过（Cloudflare 本地校验）',
     });
   });
 
