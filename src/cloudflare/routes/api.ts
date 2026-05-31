@@ -109,6 +109,105 @@ function parseStringArray(value: unknown): string[] {
   return [...deduped.values()];
 }
 
+type CloudflareAccountCredentialMode = 'auto' | 'session' | 'apikey';
+
+function parseBatchApiKeys(input: unknown): string[] {
+  if (Array.isArray(input)) {
+    return Array.from(new Set(
+      input
+        .map((item) => String(item || '').trim())
+        .filter((item) => item.length > 0),
+    ));
+  }
+
+  const raw = String(input || '').trim();
+  if (!raw) return [];
+
+  return Array.from(new Set(
+    raw
+      .split(/[\r\n,，;；\s]+/)
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0),
+  ));
+}
+
+function buildBatchApiKeyConnectionName(baseName: string | null | undefined, index: number, total: number): string {
+  const normalized = String(baseName || '').trim();
+  if (!normalized) return '';
+  if (total <= 1) return normalized;
+  return `${normalized} #${index + 1}`;
+}
+
+function resolveRequestedCredentialMode(input: unknown): CloudflareAccountCredentialMode {
+  const normalized = String(input || '').trim().toLowerCase();
+  if (normalized === 'session') return 'session';
+  if (normalized === 'apikey') return 'apikey';
+  return 'auto';
+}
+
+function parseAccountExtraConfig(extraConfig: unknown): Record<string, unknown> {
+  if (!extraConfig) return {};
+  if (typeof extraConfig === 'object' && !Array.isArray(extraConfig)) {
+    return { ...(extraConfig as Record<string, unknown>) };
+  }
+  if (typeof extraConfig !== 'string') return {};
+  const raw = extraConfig.trim();
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return { ...(parsed as Record<string, unknown>) };
+  } catch {
+    return {};
+  }
+}
+
+function mergeAccountExtraConfig(base: unknown, patch: Record<string, unknown>): string | null {
+  const merged = {
+    ...parseAccountExtraConfig(base),
+    ...patch,
+  };
+  const normalizedEntries = Object.entries(merged).filter(([, value]) => value !== undefined);
+  if (normalizedEntries.length === 0) return null;
+  return JSON.stringify(Object.fromEntries(normalizedEntries));
+}
+
+function getCredentialModeFromExtraConfig(extraConfig: unknown): CloudflareAccountCredentialMode | undefined {
+  const parsed = parseAccountExtraConfig(extraConfig);
+  const normalized = String(parsed.credentialMode || '').trim().toLowerCase();
+  if (normalized === 'session') return 'session';
+  if (normalized === 'apikey') return 'apikey';
+  if (normalized === 'auto') return 'auto';
+  return undefined;
+}
+
+function resolveStoredCredentialMode(account: typeof schema.accounts.$inferSelect): CloudflareAccountCredentialMode {
+  const explicit = getCredentialModeFromExtraConfig(account.extraConfig);
+  if (explicit) return explicit;
+  if (String(account.apiToken || '').trim()) return 'apikey';
+  if (String(account.accessToken || '').trim()) return 'session';
+  return 'auto';
+}
+
+function buildCapabilitiesFromCredentialMode(credentialMode: CloudflareAccountCredentialMode): {
+  canCheckin: boolean;
+  canRefreshBalance: boolean;
+  proxyOnly: boolean;
+} {
+  if (credentialMode === 'apikey') {
+    return {
+      canCheckin: false,
+      canRefreshBalance: false,
+      proxyOnly: true,
+    };
+  }
+  return {
+    canCheckin: true,
+    canRefreshBalance: true,
+    proxyOnly: false,
+  };
+}
+
 function parseNumberArray(value: unknown): number[] {
   const parsed = parseJsonValue(value);
   if (!Array.isArray(parsed)) return [];
@@ -2382,6 +2481,8 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
     const generatedAt = new Date().toISOString();
     const accounts = accountRows.map((account) => ({
       ...account,
+      credentialMode: resolveStoredCredentialMode(account),
+      capabilities: buildCapabilitiesFromCredentialMode(resolveStoredCredentialMode(account)),
       site: siteById.get(account.siteId) || null,
     }));
     return c.json({
@@ -5293,18 +5394,45 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
     const ids = Array.isArray(body.ids) ? [...new Set(body.ids.map((item) => Math.trunc(Number(item))).filter((id) => Number.isFinite(id) && id > 0))] : [];
     const action = String(body.action || '').trim().toLowerCase();
     if (ids.length === 0) return c.json({ success: false, message: 'ids 不能为空' }, 400);
-    if (action === 'delete') {
-      await db.delete(schema.sites).where(inArray(schema.sites.id, ids)).run();
-      return c.json({ success: true, deleted: ids.length });
+    if (!['enable', 'disable', 'delete', 'enablesystemproxy', 'disablesystemproxy'].includes(action)) {
+      return c.json({ success: false, message: '不支持的 action' }, 400);
     }
-    if (action === 'enable' || action === 'disable') {
-      await db.update(schema.sites).set({
-        status: action === 'enable' ? 'active' : 'disabled',
-        updatedAt: formatUtcSqlDateTime(),
-      }).where(inArray(schema.sites.id, ids)).run();
-      return c.json({ success: true, updated: ids.length });
+
+    const successIds: number[] = [];
+    const failedItems: Array<{ id: number; message: string }> = [];
+
+    for (const id of ids) {
+      try {
+        const existing = await db.select().from(schema.sites).where(eq(schema.sites.id, id)).get();
+        if (!existing) {
+          failedItems.push({ id, message: '站点不存在' });
+          continue;
+        }
+
+        if (action === 'delete') {
+          await db.delete(schema.sites).where(eq(schema.sites.id, id)).run();
+        } else if (action === 'enable' || action === 'disable') {
+          await db.update(schema.sites).set({
+            status: action === 'enable' ? 'active' : 'disabled',
+            updatedAt: formatUtcSqlDateTime(),
+          }).where(eq(schema.sites.id, id)).run();
+        } else if (action === 'enablesystemproxy' || action === 'disablesystemproxy') {
+          await db.update(schema.sites).set({
+            useSystemProxy: action === 'enablesystemproxy',
+            updatedAt: formatUtcSqlDateTime(),
+          }).where(eq(schema.sites.id, id)).run();
+        }
+
+        successIds.push(id);
+      } catch (error: unknown) {
+        failedItems.push({
+          id,
+          message: error instanceof Error ? error.message : '批量操作失败',
+        });
+      }
     }
-    return c.json({ success: false, message: '不支持的 action' }, 400);
+
+    return c.json({ success: true, successIds, failedItems });
   });
 
   app.post('/api/sites/detect', async (c) => {
@@ -5477,30 +5605,134 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
     const db = getCloudflareDb(c);
     const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
     const siteId = Math.trunc(Number(body.siteId));
-    const accessToken = String(body.accessToken || '').trim();
     if (!Number.isFinite(siteId) || siteId <= 0) return c.json({ success: false, message: 'siteId 无效' }, 400);
-    if (!accessToken) return c.json({ success: false, message: 'accessToken 不能为空' }, 400);
-    const inserted = await db.insert(schema.accounts).values({
-      siteId,
-      username: typeof body.username === 'string' ? body.username.trim() : null,
-      accessToken,
-      apiToken: typeof body.apiToken === 'string' ? body.apiToken.trim() : null,
-      balance: Number.isFinite(Number(body.balance)) ? Number(body.balance) : 0,
-      balanceUsed: Number.isFinite(Number(body.balanceUsed)) ? Number(body.balanceUsed) : 0,
-      quota: Number.isFinite(Number(body.quota)) ? Number(body.quota) : 0,
-      unitCost: Number.isFinite(Number(body.unitCost)) ? Number(body.unitCost) : null,
-      valueScore: Number.isFinite(Number(body.valueScore)) ? Number(body.valueScore) : 0,
-      status: String(body.status || 'active').trim() || 'active',
-      checkinEnabled: Object.prototype.hasOwnProperty.call(body, 'checkinEnabled') ? !!body.checkinEnabled : true,
-      isPinned: !!body.isPinned,
-      sortOrder: Number.isFinite(Number(body.sortOrder)) ? Math.trunc(Number(body.sortOrder)) : 0,
-      oauthProvider: typeof body.oauthProvider === 'string' ? body.oauthProvider.trim() : null,
-      oauthAccountKey: typeof body.oauthAccountKey === 'string' ? body.oauthAccountKey.trim() : null,
-      oauthProjectId: typeof body.oauthProjectId === 'string' ? body.oauthProjectId.trim() : null,
-      extraConfig: typeof body.extraConfig === 'string' ? body.extraConfig : null,
-      createdAt: formatUtcSqlDateTime(),
-      updatedAt: formatUtcSqlDateTime(),
-    }).returning().get();
+    const requestedUsername = typeof body.username === 'string' ? body.username.trim() : '';
+    const explicitBatchTokens = parseBatchApiKeys(body.accessTokens);
+    const requestedMode = explicitBatchTokens.length > 0
+      ? 'apikey'
+      : resolveRequestedCredentialMode(body.credentialMode);
+    const requestedTokens = explicitBatchTokens.length > 0
+      ? explicitBatchTokens
+      : parseBatchApiKeys(body.accessToken);
+    if (requestedTokens.length === 0) return c.json({ success: false, message: '请填写 Token' }, 400);
+
+    const insertOne = async (
+      rawToken: string,
+      usernameOverride: string | null,
+    ): Promise<(typeof schema.accounts.$inferSelect & {
+      tokenType: 'session' | 'apikey';
+      credentialMode: CloudflareAccountCredentialMode;
+      capabilities: {
+        canCheckin: boolean;
+        canRefreshBalance: boolean;
+        proxyOnly: boolean;
+      };
+      apiTokenFound: boolean;
+      usernameDetected: boolean;
+      queued: boolean;
+      modelCount: number;
+    })> => {
+      const effectiveMode: 'session' | 'apikey' = requestedMode === 'session'
+        ? 'session'
+        : requestedMode === 'apikey'
+          ? 'apikey'
+          : (/^sk-[A-Za-z0-9_\-]{4,}/.test(rawToken) ? 'apikey' : 'session');
+      const resolvedUsername = (usernameOverride || requestedUsername || '').trim();
+      const extraConfig = mergeAccountExtraConfig(body.extraConfig, {
+        credentialMode: effectiveMode,
+      });
+      const inserted = await db.insert(schema.accounts).values({
+        siteId,
+        username: resolvedUsername || null,
+        accessToken: effectiveMode === 'session' ? rawToken : '',
+        apiToken: effectiveMode === 'apikey'
+          ? rawToken
+          : (typeof body.apiToken === 'string' ? body.apiToken.trim() : null),
+        balance: Number.isFinite(Number(body.balance)) ? Number(body.balance) : 0,
+        balanceUsed: Number.isFinite(Number(body.balanceUsed)) ? Number(body.balanceUsed) : 0,
+        quota: Number.isFinite(Number(body.quota)) ? Number(body.quota) : 0,
+        unitCost: Number.isFinite(Number(body.unitCost)) ? Number(body.unitCost) : null,
+        valueScore: Number.isFinite(Number(body.valueScore)) ? Number(body.valueScore) : 0,
+        status: String(body.status || 'active').trim() || 'active',
+        checkinEnabled: effectiveMode === 'session'
+          ? (Object.prototype.hasOwnProperty.call(body, 'checkinEnabled') ? !!body.checkinEnabled : true)
+          : false,
+        isPinned: !!body.isPinned,
+        sortOrder: Number.isFinite(Number(body.sortOrder)) ? Math.trunc(Number(body.sortOrder)) : 0,
+        oauthProvider: typeof body.oauthProvider === 'string' ? body.oauthProvider.trim() : null,
+        oauthAccountKey: typeof body.oauthAccountKey === 'string' ? body.oauthAccountKey.trim() : null,
+        oauthProjectId: typeof body.oauthProjectId === 'string' ? body.oauthProjectId.trim() : null,
+        extraConfig,
+        createdAt: formatUtcSqlDateTime(),
+        updatedAt: formatUtcSqlDateTime(),
+      }).returning().get();
+
+      const credentialMode = resolveStoredCredentialMode(inserted);
+      return {
+        ...inserted,
+        tokenType: effectiveMode,
+        credentialMode,
+        capabilities: buildCapabilitiesFromCredentialMode(credentialMode),
+        apiTokenFound: !!String(inserted.apiToken || '').trim(),
+        usernameDetected: !requestedUsername && !!String(inserted.username || '').trim(),
+        queued: false,
+        modelCount: 0,
+      };
+    };
+
+    if (requestedMode === 'apikey' && requestedTokens.length > 1) {
+      const items: Array<Record<string, unknown>> = [];
+      let createdCount = 0;
+      for (const [index, token] of requestedTokens.entries()) {
+        try {
+          const created = await insertOne(
+            token,
+            buildBatchApiKeyConnectionName(requestedUsername, index, requestedTokens.length) || null,
+          );
+          createdCount += 1;
+          items.push({
+            index,
+            status: 'created',
+            id: created.id,
+            username: created.username || null,
+            queued: false,
+            message: null,
+            modelCount: 0,
+          });
+        } catch (error: unknown) {
+          items.push({
+            index,
+            status: 'failed',
+            message: error instanceof Error ? error.message : '创建失败',
+            requiresVerification: false,
+          });
+        }
+      }
+
+      if (createdCount === 0) {
+        return c.json({
+          success: false,
+          batch: true,
+          totalCount: requestedTokens.length,
+          createdCount: 0,
+          failedCount: requestedTokens.length,
+          message: `批量添加失败（0/${requestedTokens.length}）`,
+          items,
+        }, 400);
+      }
+
+      return c.json({
+        success: true,
+        batch: true,
+        totalCount: requestedTokens.length,
+        createdCount,
+        failedCount: requestedTokens.length - createdCount,
+        message: `批量添加完成：成功 ${createdCount}，失败 ${requestedTokens.length - createdCount}`,
+        items,
+      });
+    }
+
+    const inserted = await insertOne(requestedTokens[0]!, null);
     return c.json(inserted);
   });
 
@@ -5628,18 +5860,45 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
     const ids = Array.isArray(body.ids) ? [...new Set(body.ids.map((item) => Math.trunc(Number(item))).filter((id) => Number.isFinite(id) && id > 0))] : [];
     const action = String(body.action || '').trim().toLowerCase();
     if (ids.length === 0) return c.json({ success: false, message: 'ids 不能为空' }, 400);
-    if (action === 'delete') {
-      await db.delete(schema.accounts).where(inArray(schema.accounts.id, ids)).run();
-      return c.json({ success: true, deleted: ids.length });
+    if (!['enable', 'disable', 'delete', 'refreshbalance'].includes(action)) {
+      return c.json({ success: false, message: '不支持的 action' }, 400);
     }
-    if (action === 'enable' || action === 'disable') {
-      await db.update(schema.accounts).set({
-        status: action === 'enable' ? 'active' : 'disabled',
-        updatedAt: formatUtcSqlDateTime(),
-      }).where(inArray(schema.accounts.id, ids)).run();
-      return c.json({ success: true, updated: ids.length });
+
+    const successIds: number[] = [];
+    const failedItems: Array<{ id: number; message: string }> = [];
+
+    for (const id of ids) {
+      try {
+        const existing = await db.select().from(schema.accounts).where(eq(schema.accounts.id, id)).get();
+        if (!existing) {
+          failedItems.push({ id, message: '账号不存在' });
+          continue;
+        }
+
+        if (action === 'delete') {
+          await db.delete(schema.accounts).where(eq(schema.accounts.id, id)).run();
+        } else if (action === 'enable' || action === 'disable') {
+          await db.update(schema.accounts).set({
+            status: action === 'enable' ? 'active' : 'disabled',
+            updatedAt: formatUtcSqlDateTime(),
+          }).where(eq(schema.accounts.id, id)).run();
+        } else if (action === 'refreshbalance') {
+          await db.update(schema.accounts).set({
+            lastBalanceRefresh: formatUtcSqlDateTime(),
+            updatedAt: formatUtcSqlDateTime(),
+          }).where(eq(schema.accounts.id, id)).run();
+        }
+
+        successIds.push(id);
+      } catch (error: unknown) {
+        failedItems.push({
+          id,
+          message: error instanceof Error ? error.message : '批量操作失败',
+        });
+      }
     }
-    return c.json({ success: false, message: '不支持的 action' }, 400);
+
+    return c.json({ success: true, successIds, failedItems });
   });
 
   app.post('/api/accounts/:id/balance', async (c) => {
@@ -5778,16 +6037,19 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
     const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
     const accountId = Math.trunc(Number(body.accountId));
     const name = String(body.name || '').trim();
-    const token = String(body.token || '').trim();
-    if (!Number.isFinite(accountId) || accountId <= 0 || !name || !token) {
-      return c.json({ success: false, message: 'accountId/name/token 不能为空' }, 400);
+    const requestedToken = String(body.token || '').trim();
+    if (!Number.isFinite(accountId) || accountId <= 0 || !name) {
+      return c.json({ success: false, message: 'accountId/name 不能为空' }, 400);
     }
+    const token = requestedToken || `mtk-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
     const inserted = await db.insert(schema.accountTokens).values({
       accountId,
       name,
       token,
       source: typeof body.source === 'string' ? body.source.trim() : 'manual',
-      tokenGroup: typeof body.tokenGroup === 'string' ? body.tokenGroup.trim() : null,
+      tokenGroup: typeof body.tokenGroup === 'string'
+        ? body.tokenGroup.trim()
+        : (typeof body.group === 'string' ? body.group.trim() : null),
       valueStatus: typeof body.valueStatus === 'string' ? body.valueStatus.trim() : 'ready',
       enabled: Object.prototype.hasOwnProperty.call(body, 'enabled') ? !!body.enabled : true,
       isDefault: !!body.isDefault,
@@ -5831,18 +6093,40 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
     const ids = Array.isArray(body.ids) ? [...new Set(body.ids.map((item) => Math.trunc(Number(item))).filter((id) => Number.isFinite(id) && id > 0))] : [];
     const action = String(body.action || '').trim().toLowerCase();
     if (ids.length === 0) return c.json({ success: false, message: 'ids 不能为空' }, 400);
-    if (action === 'delete') {
-      await db.delete(schema.accountTokens).where(inArray(schema.accountTokens.id, ids)).run();
-      return c.json({ success: true, deleted: ids.length });
+    if (!['enable', 'disable', 'delete'].includes(action)) {
+      return c.json({ success: false, message: '不支持的 action' }, 400);
     }
-    if (action === 'enable' || action === 'disable') {
-      await db.update(schema.accountTokens).set({
-        enabled: action === 'enable',
-        updatedAt: formatUtcSqlDateTime(),
-      }).where(inArray(schema.accountTokens.id, ids)).run();
-      return c.json({ success: true, updated: ids.length });
+
+    const successIds: number[] = [];
+    const failedItems: Array<{ id: number; message: string }> = [];
+
+    for (const id of ids) {
+      try {
+        const existing = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, id)).get();
+        if (!existing) {
+          failedItems.push({ id, message: 'Token 不存在' });
+          continue;
+        }
+
+        if (action === 'delete') {
+          await db.delete(schema.accountTokens).where(eq(schema.accountTokens.id, id)).run();
+        } else {
+          await db.update(schema.accountTokens).set({
+            enabled: action === 'enable',
+            updatedAt: formatUtcSqlDateTime(),
+          }).where(eq(schema.accountTokens.id, id)).run();
+        }
+
+        successIds.push(id);
+      } catch (error: unknown) {
+        failedItems.push({
+          id,
+          message: error instanceof Error ? error.message : '批量操作失败',
+        });
+      }
     }
-    return c.json({ success: false, message: '不支持的 action' }, 400);
+
+    return c.json({ success: true, successIds, failedItems });
   });
 
   app.get('/api/account-tokens/groups/:accountId', async (c) => {
