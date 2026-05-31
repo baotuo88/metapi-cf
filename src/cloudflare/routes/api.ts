@@ -430,6 +430,21 @@ function resolveProbePlatformUserId(account: typeof schema.accounts.$inferSelect
   return null;
 }
 
+function buildProbeUserIdCandidates(account: typeof schema.accounts.$inferSelect): string[] {
+  const candidates: string[] = [];
+  const push = (value: unknown) => {
+    const id = Math.trunc(Number(value));
+    if (!Number.isFinite(id) || id <= 0) return;
+    const normalized = String(id);
+    if (!candidates.includes(normalized)) candidates.push(normalized);
+  };
+  push(resolveProbePlatformUserId(account));
+  for (const fallback of [1, 2, 3, 4, 5, 10, 20, 50, 100, 8899, 11494]) {
+    push(fallback);
+  }
+  return candidates;
+}
+
 function resolveCloudflareAccountDisplayName(account: typeof schema.accounts.$inferSelect): string | null {
   const explicit = String(account.username || '').trim();
   if (explicit) return explicit;
@@ -571,7 +586,13 @@ function buildProbeHeaders(
   }
   if (platformUserId) {
     headers['New-Api-User'] = platformUserId;
+    headers['New-API-User'] = platformUserId;
+    headers['User-id'] = platformUserId;
     headers['User-ID'] = platformUserId;
+    headers['Veloera-User'] = platformUserId;
+    headers['voapi-user'] = platformUserId;
+    headers['Rix-Api-User'] = platformUserId;
+    headers['neo-api-user'] = platformUserId;
   }
   return headers;
 }
@@ -608,6 +629,36 @@ function toBalanceDataFromPayload(raw: unknown): Record<string, unknown> | null 
     return maybeData as Record<string, unknown>;
   }
   return null;
+}
+
+function extractModelsFromPayload(raw: unknown): string[] {
+  const parseFromValue = (value: unknown): string[] => {
+    if (Array.isArray(value)) {
+      return value
+        .map((item) => {
+          if (typeof item === 'string') return item.trim();
+          if (item && typeof item === 'object') {
+            const row = item as Record<string, unknown>;
+            return String(row.id || row.model || row.name || '').trim();
+          }
+          return '';
+        })
+        .filter(Boolean);
+    }
+    if (value && typeof value === 'object') {
+      return Object.keys(value as Record<string, unknown>).map((item) => item.trim()).filter(Boolean);
+    }
+    return [];
+  };
+
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return [];
+  const root = raw as Record<string, unknown>;
+  if (root.success === false) return [];
+  const direct = parseFromValue(root.data);
+  if (direct.length > 0) return Array.from(new Set(direct));
+  const fallback = parseFromValue(root.models);
+  if (fallback.length > 0) return Array.from(new Set(fallback));
+  return [];
 }
 
 function roundCurrency(value: number): number {
@@ -649,10 +700,14 @@ async function refreshAccountBalanceFromUpstream(
   };
 
   const platformUserId = resolveProbePlatformUserId(account);
+  const platformUserIdCandidates = buildProbeUserIdCandidates(account);
   const headerAttempts: Array<Record<string, string>> = [];
   headerAttempts.push(buildProbeHeaders(site, token, platformUserId));
   if (platformUserId) {
     headerAttempts.push(buildProbeHeaders(site, token, null));
+  }
+  for (const candidate of platformUserIdCandidates) {
+    headerAttempts.push(buildProbeHeaders(site, token, candidate));
   }
 
   let data: Record<string, unknown> | null = null;
@@ -670,6 +725,15 @@ async function refreshAccountBalanceFromUpstream(
         Cookie: cookie,
         ...(platformUserId ? { 'New-Api-User': platformUserId, 'User-ID': platformUserId } : {}),
       });
+      for (const candidate of platformUserIdCandidates) {
+        fallbackHeaders.push({
+          Accept: 'application/json',
+          Cookie: cookie,
+          'New-Api-User': candidate,
+          'User-ID': candidate,
+          'User-id': candidate,
+        });
+      }
       fallbackHeaders.push({
         Accept: 'application/json',
         Cookie: cookie,
@@ -699,6 +763,80 @@ async function refreshAccountBalanceFromUpstream(
     used: roundCurrency(usedUnit),
     quota: roundCurrency(quota),
   };
+}
+
+async function fetchModelsViaSessionApi(
+  endpointUrl: string,
+  site: typeof schema.sites.$inferSelect,
+  account: typeof schema.accounts.$inferSelect,
+  token: string,
+): Promise<{ models: string[]; latencyMs: number } | null> {
+  const normalizedEndpoint = normalizeEndpointBaseUrl(endpointUrl);
+  if (!normalizedEndpoint) return null;
+  const platformUserId = resolveProbePlatformUserId(account);
+  const platformUserIdCandidates = buildProbeUserIdCandidates(account);
+  const startedAt = Date.now();
+
+  const readModels = async (headers: Record<string, string>): Promise<string[] | null> => {
+    const response = await fetch(`${normalizedEndpoint}/api/user/models`, {
+      method: 'GET',
+      headers,
+    }).catch(() => null);
+    if (!response || !response.ok) return null;
+    const payload = await response.json().catch(() => null);
+    const models = extractModelsFromPayload(payload);
+    return models.length > 0 ? models : null;
+  };
+
+  const headerAttempts: Array<Record<string, string>> = [];
+  headerAttempts.push(buildProbeHeaders(site, token, platformUserId));
+  headerAttempts.push(buildProbeHeaders(site, token, null));
+  for (const candidate of platformUserIdCandidates) {
+    headerAttempts.push(buildProbeHeaders(site, token, candidate));
+  }
+  for (const headers of headerAttempts) {
+    const models = await readModels(headers);
+    if (models && models.length > 0) {
+      return {
+        models: Array.from(new Set(models)),
+        latencyMs: Date.now() - startedAt,
+      };
+    }
+  }
+
+  const cookieCandidates = buildSessionCookieCandidates(token);
+  for (const cookie of cookieCandidates) {
+    const cookieHeaders: Array<Record<string, string>> = [];
+    cookieHeaders.push({
+      Accept: 'application/json',
+      Cookie: cookie,
+      ...(platformUserId ? { 'New-Api-User': platformUserId, 'User-ID': platformUserId } : {}),
+    });
+    for (const candidate of platformUserIdCandidates) {
+      cookieHeaders.push({
+        Accept: 'application/json',
+        Cookie: cookie,
+        'New-Api-User': candidate,
+        'User-ID': candidate,
+        'User-id': candidate,
+      });
+    }
+    cookieHeaders.push({
+      Accept: 'application/json',
+      Cookie: cookie,
+    });
+    for (const headers of cookieHeaders) {
+      const models = await readModels(headers);
+      if (models && models.length > 0) {
+        return {
+          models: Array.from(new Set(models)),
+          latencyMs: Date.now() - startedAt,
+        };
+      }
+    }
+  }
+
+  return null;
 }
 
 async function upsertAccountModelAvailability(
@@ -825,6 +963,24 @@ async function runAccountModelProbe(
       };
     }
     lastFailure = result;
+  }
+
+  if (resolveStoredCredentialMode(account) === 'session') {
+    for (const endpoint of endpoints) {
+      const fallback = await fetchModelsViaSessionApi(endpoint, site, account, token);
+      if (!fallback || fallback.models.length === 0) continue;
+      await upsertAccountModelAvailability(db, account.id, fallback.models, fallback.latencyMs);
+      return {
+        status: 'success',
+        errorCode: null,
+        errorMessage: null,
+        modelCount: fallback.models.length,
+        modelsPreview: fallback.models.slice(0, 10),
+        models: fallback.models,
+        endpointUrl: endpoint,
+        latencyMs: fallback.latencyMs,
+      };
+    }
   }
 
   return {
