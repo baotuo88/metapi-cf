@@ -420,6 +420,27 @@ function resolveProbeToken(account: typeof schema.accounts.$inferSelect, site: t
   return String(account.accessToken || account.apiToken || site.apiKey || '').trim();
 }
 
+function resolveProbePlatformUserId(account: typeof schema.accounts.$inferSelect): string | null {
+  const extra = parseAccountExtraConfig(account.extraConfig);
+  const rawId = Math.trunc(Number(extra.platformUserId));
+  if (Number.isFinite(rawId) && rawId > 0) return String(rawId);
+  const username = String(account.username || '').trim();
+  const match = username.match(/(\d{3,8})$/);
+  if (match?.[1]) return match[1];
+  return null;
+}
+
+function resolveCloudflareAccountDisplayName(account: typeof schema.accounts.$inferSelect): string | null {
+  const explicit = String(account.username || '').trim();
+  if (explicit) return explicit;
+  if (resolveStoredCredentialMode(account) !== 'session') return null;
+  const platformUserId = resolveProbePlatformUserId(account);
+  if (platformUserId) return `user-${platformUserId}`;
+  const token = String(account.accessToken || '').trim();
+  if (!token) return null;
+  return `session-${token.slice(0, 8)}`;
+}
+
 type ProbeFetchResult =
   | { success: true; models: string[]; latencyMs: number; endpointUrl: string }
   | {
@@ -534,6 +555,7 @@ async function resolveSiteProbeEndpoints(
 function buildProbeHeaders(
   site: typeof schema.sites.$inferSelect,
   token: string,
+  platformUserId?: string | null,
 ): Record<string, string> {
   const headers: Record<string, string> = {
     Accept: 'application/json',
@@ -547,7 +569,77 @@ function buildProbeHeaders(
   if (!hasAuthorization && token) {
     headers.Authorization = `Bearer ${token}`;
   }
+  if (platformUserId) {
+    headers['New-Api-User'] = platformUserId;
+    headers['User-ID'] = platformUserId;
+  }
   return headers;
+}
+
+function parseUserSelfPayload(raw: unknown): Record<string, unknown> | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const root = raw as Record<string, unknown>;
+  if (root.data && typeof root.data === 'object' && !Array.isArray(root.data)) {
+    return root.data as Record<string, unknown>;
+  }
+  return root;
+}
+
+function roundCurrency(value: number): number {
+  return Math.round(value * 1_000_000) / 1_000_000;
+}
+
+function mapQuotaUnitScale(platform: string): number {
+  const normalized = platform.trim().toLowerCase();
+  if (normalized === 'veloera') return 1_000_000;
+  return 500_000;
+}
+
+function shouldTreatQuotaAsRemaining(platform: string): boolean {
+  const normalized = platform.trim().toLowerCase();
+  return normalized === 'new-api' || normalized === 'anyrouter' || normalized === 'donehub';
+}
+
+async function refreshAccountBalanceFromUpstream(
+  account: typeof schema.accounts.$inferSelect,
+  site: typeof schema.sites.$inferSelect | null | undefined,
+): Promise<{ balance: number; used: number; quota: number } | null> {
+  if (!site) return null;
+  if (String(account.status || '').trim().toLowerCase() !== 'active') return null;
+  if (String(site.status || '').trim().toLowerCase() !== 'active') return null;
+
+  const token = resolveProbeToken(account, site);
+  if (!token) return null;
+  const endpoint = normalizeEndpointBaseUrl(site.url);
+  if (!endpoint) return null;
+
+  const headers = buildProbeHeaders(site, token, resolveProbePlatformUserId(account));
+  const response = await fetch(`${endpoint}/api/user/self`, {
+    method: 'GET',
+    headers,
+  }).catch(() => null);
+  if (!response || !response.ok) return null;
+
+  const payload = await response.json().catch(() => null);
+  const data = parseUserSelfPayload(payload);
+  if (!data) return null;
+
+  const rawQuota = Number(data.quota);
+  const rawUsed = Number(data.used_quota ?? data.usedQuota);
+  if (!Number.isFinite(rawQuota) || !Number.isFinite(rawUsed)) return null;
+
+  const scale = mapQuotaUnitScale(String(site.platform || ''));
+  const quotaUnit = rawQuota / scale;
+  const usedUnit = rawUsed / scale;
+  const remainingMode = shouldTreatQuotaAsRemaining(String(site.platform || ''));
+
+  const balance = remainingMode ? quotaUnit : quotaUnit - usedUnit;
+  const quota = remainingMode ? quotaUnit + usedUnit : quotaUnit;
+  return {
+    balance: roundCurrency(balance),
+    used: roundCurrency(usedUnit),
+    quota: roundCurrency(quota),
+  };
 }
 
 async function upsertAccountModelAvailability(
@@ -655,7 +747,7 @@ async function runAccountModelProbe(
     };
   }
 
-  const headers = buildProbeHeaders(site, token);
+  const headers = buildProbeHeaders(site, token, resolveProbePlatformUserId(account));
   let lastFailure: Extract<ProbeFetchResult, { success: false }> | null = null;
   for (const endpoint of endpoints) {
     const result = await fetchModelsViaEndpoint(endpoint, headers);
@@ -2566,8 +2658,10 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
     const generatedAt = new Date().toISOString();
     const accounts = accountRows.map((account) => {
       const site = siteById.get(account.siteId) || null;
+      const displayName = resolveCloudflareAccountDisplayName(account);
       return {
         ...account,
+        username: String(account.username || '').trim() || displayName || null,
         credentialMode: resolveStoredCredentialMode(account),
         capabilities: buildCapabilitiesFromCredentialMode(resolveStoredCredentialMode(account)),
         runtimeHealth: buildAccountRuntimeHealthView({
@@ -5367,6 +5461,7 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
     const account = await db.select().from(schema.accounts).where(eq(schema.accounts.id, accountId)).get();
     if (!account) return c.json({ success: false, message: '账号不存在' }, 404);
     const site = await db.select().from(schema.sites).where(eq(schema.sites.id, account.siteId)).get();
+    const siteId = account.siteId;
     const rows = await db
       .select({
         modelName: schema.modelAvailability.modelName,
@@ -5377,13 +5472,28 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
       .from(schema.modelAvailability)
       .where(eq(schema.modelAvailability.accountId, accountId))
       .all();
-    const models = rows.map((row) => ({
-      name: row.modelName,
-      latencyMs: row.latencyMs ?? null,
-      disabled: row.available === false,
-      isManual: !!row.isManual,
-    }));
+
+    const disabledRows = await db
+      .select({
+        modelName: schema.siteDisabledModels.modelName,
+      })
+      .from(schema.siteDisabledModels)
+      .where(eq(schema.siteDisabledModels.siteId, siteId))
+      .all();
+    const disabledSet = new Set(disabledRows.map((row) => String(row.modelName || '').trim()).filter(Boolean));
+
+    const models = rows
+      .filter((row) => row.available !== false)
+      .map((row) => ({
+        name: row.modelName,
+        latencyMs: row.latencyMs ?? null,
+        disabled: disabledSet.has(String(row.modelName || '').trim()),
+        isManual: !!row.isManual,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
     return c.json({
+      siteId,
       models,
       totalCount: models.length,
       disabledCount: models.filter((item) => item.disabled).length,
@@ -6161,8 +6271,27 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
             updatedAt: formatUtcSqlDateTime(),
           }).where(eq(schema.accounts.id, id)).run();
         } else if (action === 'refreshbalance') {
+          const site = await db.select().from(schema.sites).where(eq(schema.sites.id, existing.siteId)).get();
+          const balance = await refreshAccountBalanceFromUpstream(existing, site);
+          const runtimeHealth = buildRuntimeHealthRecord({
+            state: balance ? 'healthy' : 'unknown',
+            reason: balance ? '余额刷新成功' : '余额刷新未获取到上游数据',
+            source: 'balance',
+            checkedAt: new Date().toISOString(),
+          });
+          const nextExtraConfig = mergeAccountExtraConfig(existing.extraConfig, {
+            runtimeHealth,
+          });
           await db.update(schema.accounts).set({
+            ...(balance
+              ? {
+                balance: balance.balance,
+                balanceUsed: balance.used,
+                quota: balance.quota,
+              }
+              : {}),
             lastBalanceRefresh: formatUtcSqlDateTime(),
+            extraConfig: nextExtraConfig,
             updatedAt: formatUtcSqlDateTime(),
           }).where(eq(schema.accounts.id, id)).run();
         }
@@ -6185,9 +6314,11 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
     if (!Number.isFinite(id) || id <= 0) return c.json({ success: false, message: 'accountId 无效' }, 400);
     const account = await db.select().from(schema.accounts).where(eq(schema.accounts.id, id)).get();
     if (!account) return c.json({ success: false, message: '账号不存在' }, 404);
+    const site = await db.select().from(schema.sites).where(eq(schema.sites.id, account.siteId)).get();
+    const refreshed = await refreshAccountBalanceFromUpstream(account, site);
     const runtimeHealth = buildRuntimeHealthRecord({
-      state: 'healthy',
-      reason: '余额刷新成功',
+      state: refreshed ? 'healthy' : 'unknown',
+      reason: refreshed ? '余额刷新成功' : '余额刷新未获取到上游数据',
       source: 'balance',
       checkedAt: new Date().toISOString(),
     });
@@ -6195,6 +6326,13 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
       runtimeHealth,
     });
     await db.update(schema.accounts).set({
+      ...(refreshed
+        ? {
+          balance: refreshed.balance,
+          balanceUsed: refreshed.used,
+          quota: refreshed.quota,
+        }
+        : {}),
       lastBalanceRefresh: formatUtcSqlDateTime(),
       extraConfig: nextExtraConfig,
       updatedAt: formatUtcSqlDateTime(),
