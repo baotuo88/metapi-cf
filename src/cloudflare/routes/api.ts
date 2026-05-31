@@ -5177,6 +5177,14 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
           site: row.site,
           account: row.account,
         });
+        const refreshedBalance = checkinResult.status === 'success'
+          ? await refreshAccountBalanceFromUpstream(row.account, row.site).catch(() => null)
+          : null;
+        let rewardValue = checkinResult.reward;
+        if (!rewardValue && refreshedBalance) {
+          const balanceDelta = roundCurrency(toFiniteNumber(refreshedBalance.balance) - toFiniteNumber(row.account.balance));
+          if (balanceDelta > 0) rewardValue = String(balanceDelta);
+        }
         const runtimeHealth = buildRuntimeHealthRecord({
           state: checkinResult.runtimeState,
           reason: checkinResult.runtimeReason,
@@ -5190,11 +5198,19 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
           accountId: row.account.id,
           status: checkinResult.status,
           message: checkinResult.message,
-          reward: checkinResult.reward,
+          reward: rewardValue,
           createdAt: now,
         }).run();
         await db.update(schema.accounts).set({
           ...(checkinResult.status === 'success' ? { lastCheckinAt: now } : {}),
+          ...(refreshedBalance
+            ? {
+              balance: refreshedBalance.balance,
+              balanceUsed: refreshedBalance.used,
+              quota: refreshedBalance.quota,
+              ...(String(row.account.username || '').trim() ? {} : { username: refreshedBalance.username || null }),
+            }
+            : {}),
           extraConfig: nextExtraConfig,
           updatedAt: now,
         }).where(eq(schema.accounts.id, row.account.id)).run();
@@ -5267,6 +5283,14 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
       site: site!,
       account,
     });
+    const refreshedBalance = checkinResult.status === 'success'
+      ? await refreshAccountBalanceFromUpstream(account, site).catch(() => null)
+      : null;
+    let rewardValue = checkinResult.reward;
+    if (!rewardValue && refreshedBalance) {
+      const balanceDelta = roundCurrency(toFiniteNumber(refreshedBalance.balance) - toFiniteNumber(account.balance));
+      if (balanceDelta > 0) rewardValue = String(balanceDelta);
+    }
     const runtimeHealth = buildRuntimeHealthRecord({
       state: checkinResult.runtimeState,
       reason: checkinResult.runtimeReason,
@@ -5280,11 +5304,19 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
       accountId,
       status: checkinResult.status,
       message: checkinResult.message,
-      reward: checkinResult.reward,
+      reward: rewardValue,
       createdAt: now,
     }).run();
     await db.update(schema.accounts).set({
       ...(checkinResult.status === 'success' ? { lastCheckinAt: now } : {}),
+      ...(refreshedBalance
+        ? {
+          balance: refreshedBalance.balance,
+          balanceUsed: refreshedBalance.used,
+          quota: refreshedBalance.quota,
+          ...(String(account.username || '').trim() ? {} : { username: refreshedBalance.username || null }),
+        }
+        : {}),
       extraConfig: nextExtraConfig,
       updatedAt: now,
     }).where(eq(schema.accounts.id, accountId)).run();
@@ -5299,6 +5331,14 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
       success: true,
       status: checkinResult.status,
       ...(checkinResult.status === 'skipped' ? { skipped: true } : {}),
+      ...(refreshedBalance
+        ? {
+          balance: refreshedBalance.balance,
+          balanceUsed: refreshedBalance.used,
+          quota: refreshedBalance.quota,
+        }
+        : {}),
+      ...(rewardValue ? { reward: rewardValue } : {}),
       message: checkinResult.message || '签到完成',
     });
   });
