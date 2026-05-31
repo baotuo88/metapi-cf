@@ -6751,6 +6751,8 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
     const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
     const siteId = Math.trunc(Number(body.siteId));
     if (!Number.isFinite(siteId) || siteId <= 0) return c.json({ success: false, message: 'siteId 无效' }, 400);
+    const site = await db.select().from(schema.sites).where(eq(schema.sites.id, siteId)).get();
+    if (!site) return c.json({ success: false, message: 'site not found' }, 404);
     const requestedUsername = typeof body.username === 'string' ? body.username.trim() : '';
     const explicitBatchTokens = parseBatchApiKeys(body.accessTokens);
     const requestedMode = explicitBatchTokens.length > 0
@@ -6782,20 +6784,71 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
         : requestedMode === 'apikey'
           ? 'apikey'
           : (/^sk-[A-Za-z0-9_\-]{4,}/.test(rawToken) ? 'apikey' : 'session');
-      const resolvedUsername = (usernameOverride || requestedUsername || '').trim();
+      let resolvedUsername = (usernameOverride || requestedUsername || '').trim();
+      let resolvedPlatformUserId = parseNumericUserId(body.platformUserId)
+        ?? guessPlatformUserIdFromUsername(resolvedUsername);
+      let resolvedApiToken = effectiveMode === 'apikey'
+        ? rawToken
+        : (typeof body.apiToken === 'string' ? body.apiToken.trim() : '');
+      let resolvedBalance = Number.isFinite(Number(body.balance)) ? Number(body.balance) : 0;
+      let resolvedBalanceUsed = Number.isFinite(Number(body.balanceUsed)) ? Number(body.balanceUsed) : 0;
+      let resolvedQuota = Number.isFinite(Number(body.quota)) ? Number(body.quota) : 0;
+      let modelCount = 0;
+
+      const skipModelFetch = !!body.skipModelFetch;
+      if (effectiveMode === 'session') {
+        const verify = await performSessionTokenVerification({
+          site,
+          token: rawToken,
+          platformUserId: resolvedPlatformUserId,
+        });
+        if (!verify.success) {
+          const mappedFailure = buildVerificationFailurePayload(verify.reason);
+          throw new Error(
+            String(mappedFailure?.message || verify.message || 'Session Token 验证失败'),
+          );
+        }
+        const verifiedUserId = parseNumericUserId(verify.result.userInfo.userId);
+        if (verifiedUserId) resolvedPlatformUserId = verifiedUserId;
+        if (!resolvedUsername) {
+          resolvedUsername = String(verify.result.userInfo.username || '').trim();
+        }
+        if (verify.result.apiToken) {
+          resolvedApiToken = verify.result.apiToken;
+        }
+        if (verify.result.balance) {
+          resolvedBalance = toFiniteNumber(verify.result.balance.balance);
+          resolvedBalanceUsed = toFiniteNumber(verify.result.balance.used);
+          resolvedQuota = toFiniteNumber(verify.result.balance.quota);
+        }
+      } else if (!skipModelFetch) {
+        const apiKeyVerify = await performApiKeyVerification({
+          db,
+          site,
+          token: rawToken,
+          platformUserId: resolvedPlatformUserId,
+        });
+        if (!apiKeyVerify.success) {
+          const mappedFailure = buildVerificationFailurePayload(apiKeyVerify.reason);
+          throw new Error(
+            String(mappedFailure?.message || apiKeyVerify.message || 'API Key 验证失败'),
+          );
+        }
+        modelCount = apiKeyVerify.models.length;
+      }
+
       const extraConfig = mergeAccountExtraConfig(body.extraConfig, {
         credentialMode: effectiveMode,
+        ...(resolvedPlatformUserId ? { platformUserId: resolvedPlatformUserId } : {}),
       });
       const inserted = await db.insert(schema.accounts).values({
         siteId,
         username: resolvedUsername || null,
         accessToken: effectiveMode === 'session' ? rawToken : '',
-        apiToken: effectiveMode === 'apikey'
-          ? rawToken
-          : (typeof body.apiToken === 'string' ? body.apiToken.trim() : null),
-        balance: Number.isFinite(Number(body.balance)) ? Number(body.balance) : 0,
-        balanceUsed: Number.isFinite(Number(body.balanceUsed)) ? Number(body.balanceUsed) : 0,
-        quota: Number.isFinite(Number(body.quota)) ? Number(body.quota) : 0,
+        apiToken: resolvedApiToken || null,
+        balance: resolvedBalance,
+        balanceUsed: resolvedBalanceUsed,
+        quota: resolvedQuota,
         unitCost: Number.isFinite(Number(body.unitCost)) ? Number(body.unitCost) : null,
         valueScore: Number.isFinite(Number(body.valueScore)) ? Number(body.valueScore) : 0,
         status: String(body.status || 'active').trim() || 'active',
@@ -6812,6 +6865,27 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
         updatedAt: formatUtcSqlDateTime(),
       }).returning().get();
 
+      if (!(effectiveMode === 'apikey' && skipModelFetch)) {
+        const refresh = await runAccountModelProbe(db, inserted, site).catch(() => null);
+        if (refresh?.status === 'success') {
+          modelCount = Math.max(modelCount, refresh.modelCount);
+          const runtimeHealth = buildRuntimeHealthRecord({
+            state: 'healthy',
+            reason: `模型探测成功（${refresh.modelCount}）`,
+            source: 'account-create',
+            checkedAt: new Date().toISOString(),
+          });
+          const refreshedExtraConfig = mergeAccountExtraConfig(inserted.extraConfig, {
+            runtimeHealth,
+          });
+          await db.update(schema.accounts).set({
+            extraConfig: refreshedExtraConfig,
+            updatedAt: formatUtcSqlDateTime(),
+          }).where(eq(schema.accounts.id, inserted.id)).run();
+          inserted.extraConfig = refreshedExtraConfig;
+        }
+      }
+
       const credentialMode = resolveStoredCredentialMode(inserted);
       return {
         ...inserted,
@@ -6821,7 +6895,7 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
         apiTokenFound: !!String(inserted.apiToken || '').trim(),
         usernameDetected: !requestedUsername && !!String(inserted.username || '').trim(),
         queued: false,
-        modelCount: 0,
+        modelCount,
       };
     };
 
