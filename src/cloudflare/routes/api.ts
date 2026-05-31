@@ -451,9 +451,7 @@ function resolveCloudflareAccountDisplayName(account: typeof schema.accounts.$in
   if (resolveStoredCredentialMode(account) !== 'session') return null;
   const platformUserId = resolveProbePlatformUserId(account);
   if (platformUserId) return `user-${platformUserId}`;
-  const token = String(account.accessToken || '').trim();
-  if (!token) return null;
-  return `session-${token.slice(0, 8)}`;
+  return null;
 }
 
 type ProbeFetchResult =
@@ -679,7 +677,7 @@ function shouldTreatQuotaAsRemaining(platform: string): boolean {
 async function refreshAccountBalanceFromUpstream(
   account: typeof schema.accounts.$inferSelect,
   site: typeof schema.sites.$inferSelect | null | undefined,
-): Promise<{ balance: number; used: number; quota: number } | null> {
+): Promise<{ balance: number; used: number; quota: number; username: string | null } | null> {
   if (!site) return null;
   if (String(account.status || '').trim().toLowerCase() !== 'active') return null;
   if (String(site.status || '').trim().toLowerCase() !== 'active') return null;
@@ -750,6 +748,7 @@ async function refreshAccountBalanceFromUpstream(
   const rawQuota = Number(data.quota ?? data.remain_quota ?? data.remaining_quota ?? data.total_available);
   const rawUsed = Number(data.used_quota ?? data.usedQuota ?? data.total_used ?? 0);
   if (!Number.isFinite(rawQuota) || !Number.isFinite(rawUsed)) return null;
+  const username = String(data.username ?? data.display_name ?? data.displayName ?? '').trim() || null;
 
   const scale = mapQuotaUnitScale(String(site.platform || ''));
   const quotaUnit = rawQuota / scale;
@@ -762,6 +761,7 @@ async function refreshAccountBalanceFromUpstream(
     balance: roundCurrency(balance),
     used: roundCurrency(usedUnit),
     quota: roundCurrency(quota),
+    username,
   };
 }
 
@@ -6503,6 +6503,7 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
                 balance: balance.balance,
                 balanceUsed: balance.used,
                 quota: balance.quota,
+                ...(String(existing.username || '').trim() ? {} : { username: balance.username || null }),
               }
               : {}),
             lastBalanceRefresh: formatUtcSqlDateTime(),
@@ -6546,6 +6547,7 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
           balance: refreshed.balance,
           balanceUsed: refreshed.used,
           quota: refreshed.quota,
+          ...(String(account.username || '').trim() ? {} : { username: refreshed.username || null }),
         }
         : {}),
       lastBalanceRefresh: formatUtcSqlDateTime(),
