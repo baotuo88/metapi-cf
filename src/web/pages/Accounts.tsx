@@ -459,12 +459,21 @@ export default function Accounts() {
       return;
     }
     const credentialMode = activeSegment === "apikey" ? "apikey" : "session";
+    const verifiedSessionUsername =
+      credentialMode === "session" &&
+      verifyResult?.success &&
+      verifyResult?.tokenType === "session" &&
+      typeof verifyResult?.userInfo?.username === "string"
+        ? verifyResult.userInfo.username.trim()
+        : "";
+    const effectiveUsername =
+      tokenForm.username.trim() || verifiedSessionUsername || undefined;
     const initializationPreset = createIntentPreset;
     setSaving(true);
     try {
       const result = await api.addAccount({
         siteId: tokenForm.siteId,
-        username: tokenForm.username.trim() || undefined,
+        username: effectiveUsername,
         accessToken: tokenForm.accessToken,
         accessTokens: isBatchApiKeyInput ? parsedApiKeys : undefined,
         platformUserId: tokenForm.platformUserId
