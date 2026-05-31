@@ -454,6 +454,623 @@ function resolveCloudflareAccountDisplayName(account: typeof schema.accounts.$in
   return null;
 }
 
+type CloudflareLoginFailureInfo = {
+  message: string;
+  shieldBlocked: boolean;
+};
+
+type CloudflareVerifyFailureReason =
+  | 'needs-user-id'
+  | 'invalid-user-id'
+  | 'shield-blocked'
+  | null;
+
+type CloudflareSessionVerifySuccess = {
+  tokenType: 'session';
+  userInfo: {
+    username: string;
+    displayName?: string;
+    email?: string;
+    role?: number;
+    userId?: string;
+  };
+  balance: {
+    balance: number;
+    used?: number;
+    quota?: number;
+  } | null;
+  apiToken: string | null;
+};
+
+const ACCOUNT_LOGIN_TIMEOUT_MS = 12_000;
+const ACCOUNT_VERIFY_TIMEOUT_MS = 12_000;
+
+function normalizeLoginFailure(message: string | null | undefined): CloudflareLoginFailureInfo {
+  const raw = String(message || '').trim();
+  const lowered = raw.toLowerCase();
+  const looksLikeHtmlJsonParseError = lowered.includes('unexpected token')
+    && lowered.includes('not valid json')
+    && (lowered.includes('<html') || lowered.includes('<script'));
+  const looksLikeShieldChallenge = lowered.includes('acw_sc__v2')
+    || lowered.includes('var arg1')
+    || lowered.includes('captcha')
+    || lowered.includes('challenge')
+    || lowered.includes('cloudflare tunnel error');
+
+  if (looksLikeHtmlJsonParseError || looksLikeShieldChallenge) {
+    return {
+      shieldBlocked: true,
+      message: 'This site is shielded by anti-bot challenge. Account/password login is blocked. Create an API key on the target site and import that key.',
+    };
+  }
+
+  return {
+    shieldBlocked: false,
+    message: raw || 'login failed',
+  };
+}
+
+function resolveUserIdFailureReason(message: string, hasProvidedUserId: boolean): CloudflareVerifyFailureReason {
+  const lowered = String(message || '').trim().toLowerCase();
+  if (!lowered) return null;
+
+  if (
+    lowered.includes('mismatch')
+    || lowered.includes('not match')
+    || lowered.includes('invalid user id')
+    || lowered.includes('wrong user id')
+  ) {
+    return 'invalid-user-id';
+  }
+
+  if (
+    lowered.includes('missing new-api-user')
+    || lowered.includes('new-api-user required')
+    || lowered.includes('requires user id')
+    || lowered.includes('missing user id')
+  ) {
+    return 'needs-user-id';
+  }
+
+  if (lowered.includes('new-api-user') || lowered.includes('user id')) {
+    return hasProvidedUserId ? 'invalid-user-id' : 'needs-user-id';
+  }
+
+  return null;
+}
+
+function buildVerificationFailurePayload(reason: CloudflareVerifyFailureReason): Record<string, unknown> | null {
+  if (reason === 'needs-user-id') {
+    return {
+      success: false,
+      needsUserId: true,
+      message: 'This site requires a user ID. Please fill in your site user ID.',
+    };
+  }
+  if (reason === 'invalid-user-id') {
+    return {
+      success: false,
+      invalidUserId: true,
+      message: 'The provided user ID does not match this token. Please check your site user ID.',
+    };
+  }
+  if (reason === 'shield-blocked') {
+    return {
+      success: false,
+      shieldBlocked: true,
+      message: 'This site is shielded by anti-bot challenge. Create an API key on the target site and import that key.',
+    };
+  }
+  return null;
+}
+
+async function withTimeout<T>(
+  fn: () => Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      fn(),
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function parseJsonSafe(raw: string): unknown | null {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+}
+
+function extractMessageFromPayload(payload: unknown): string {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return '';
+  const root = payload as Record<string, unknown>;
+  const direct = root.message;
+  if (typeof direct === 'string' && direct.trim()) return direct.trim();
+  const err = root.error;
+  if (typeof err === 'string' && err.trim()) return err.trim();
+  if (err && typeof err === 'object' && !Array.isArray(err)) {
+    const nested = (err as Record<string, unknown>).message;
+    if (typeof nested === 'string' && nested.trim()) return nested.trim();
+  }
+  return '';
+}
+
+function isShieldChallengeResponse(contentType: string, bodyText: string): boolean {
+  const normalizedType = String(contentType || '').toLowerCase();
+  const normalizedBody = String(bodyText || '').toLowerCase();
+  if (!normalizedBody) return false;
+  const isHtml = normalizedType.includes('text/html')
+    || normalizedBody.includes('<html')
+    || normalizedBody.includes('<script');
+  if (!isHtml) return false;
+  return normalizedBody.includes('acw_sc__v2')
+    || normalizedBody.includes('var arg1')
+    || normalizedBody.includes('cdn_sec_tc')
+    || normalizedBody.includes('captcha')
+    || normalizedBody.includes('challenge');
+}
+
+function splitSetCookieHeader(raw: string): string[] {
+  const text = String(raw || '').trim();
+  if (!text) return [];
+  const parts = text
+    .split(/,\s*(?=[A-Za-z0-9_\-]+=)/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return parts.length > 0 ? parts : [text];
+}
+
+function sanitizeCookiePairs(raw: string): string {
+  const pairs = splitSetCookieHeader(raw)
+    .map((cookie) => cookie.split(';')[0]?.trim() || '')
+    .filter((cookie) => cookie.includes('='));
+  return pairs.join('; ');
+}
+
+function extractAccessTokenFromLoginPayload(payload: unknown): string | null {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+  const root = payload as Record<string, unknown>;
+  const candidates: unknown[] = [
+    root.data,
+    root.token,
+    root.access_token,
+    root.accessToken,
+    root.session,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+    if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
+      const record = candidate as Record<string, unknown>;
+      for (const key of ['token', 'access_token', 'accessToken', 'session', 'cookie']) {
+        const value = record[key];
+        if (typeof value === 'string' && value.trim()) return value.trim();
+      }
+    }
+  }
+  return null;
+}
+
+function parseNumericUserId(value: unknown): number | null {
+  const parsed = Math.trunc(Number(value));
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed;
+}
+
+function guessPlatformUserIdFromUsername(username: string): number | null {
+  const match = String(username || '').trim().match(/(\d{3,8})$/);
+  if (!match?.[1]) return null;
+  return parseNumericUserId(match[1]);
+}
+
+function buildVerifyUserIdCandidates(platformUserId: number | null): string[] {
+  const candidates: string[] = [];
+  const push = (value: unknown) => {
+    const normalized = parseNumericUserId(value);
+    if (!normalized) return;
+    const text = String(normalized);
+    if (!candidates.includes(text)) candidates.push(text);
+  };
+  push(platformUserId);
+  for (const fallback of [1, 2, 3, 4, 5, 10, 20, 50, 100, 8899, 11494]) {
+    push(fallback);
+  }
+  return candidates;
+}
+
+function chooseFailureReason(
+  previous: CloudflareVerifyFailureReason,
+  next: CloudflareVerifyFailureReason,
+): CloudflareVerifyFailureReason {
+  if (next === 'invalid-user-id') return 'invalid-user-id';
+  if (previous === 'invalid-user-id') return previous;
+  if (next === 'needs-user-id') return 'needs-user-id';
+  if (previous === 'needs-user-id') return previous;
+  if (next === 'shield-blocked') return 'shield-blocked';
+  return previous;
+}
+
+function parseSessionVerifyDataToUserInfo(data: Record<string, unknown>): {
+  username: string;
+  displayName?: string;
+  email?: string;
+  role?: number;
+  userId?: string;
+} {
+  const userIdValue = data.id ?? data.userId ?? data.user_id;
+  const userId = parseNumericUserId(userIdValue);
+  const username = String(
+    data.username
+    ?? data.display_name
+    ?? data.displayName
+    ?? data.email
+    ?? (userId ? `user-${userId}` : ''),
+  ).trim() || (userId ? `user-${userId}` : 'unknown-user');
+  const displayName = String(data.display_name ?? data.displayName ?? '').trim();
+  const email = String(data.email ?? '').trim();
+  const role = Number.isFinite(Number(data.role)) ? Number(data.role) : undefined;
+  return {
+    username,
+    ...(displayName ? { displayName } : {}),
+    ...(email ? { email } : {}),
+    ...(typeof role === 'number' ? { role } : {}),
+    ...(userId ? { userId: String(userId) } : {}),
+  };
+}
+
+function parseSessionVerifyBalance(
+  data: Record<string, unknown>,
+  platform: string,
+): { balance: number; used?: number; quota?: number } | null {
+  const rawQuota = Number(data.quota ?? data.remain_quota ?? data.remaining_quota ?? data.total_available);
+  const rawUsed = Number(data.used_quota ?? data.usedQuota ?? data.total_used ?? 0);
+  if (!Number.isFinite(rawQuota) || !Number.isFinite(rawUsed)) return null;
+  const scale = mapQuotaUnitScale(platform);
+  const quotaUnit = rawQuota / scale;
+  const usedUnit = rawUsed / scale;
+  const remainingMode = shouldTreatQuotaAsRemaining(platform);
+  const balance = remainingMode ? quotaUnit : quotaUnit - usedUnit;
+  const quota = remainingMode ? quotaUnit + usedUnit : quotaUnit;
+  return {
+    balance: roundCurrency(balance),
+    used: roundCurrency(usedUnit),
+    quota: roundCurrency(quota),
+  };
+}
+
+function extractApiTokenItemsFromPayload(payload: unknown): Array<{ key: string; enabled: boolean }> {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return [];
+  const root = payload as Record<string, unknown>;
+  const source = Array.isArray(root.data)
+    ? root.data
+    : (root.data && typeof root.data === 'object' && !Array.isArray(root.data) && Array.isArray((root.data as Record<string, unknown>).items))
+      ? (root.data as Record<string, unknown>).items as unknown[]
+      : Array.isArray(root.items)
+        ? root.items
+        : [];
+  const output: Array<{ key: string; enabled: boolean }> = [];
+  for (const item of source) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const row = item as Record<string, unknown>;
+    const key = String(row.key ?? row.token ?? row.api_token ?? '').trim();
+    if (!key) continue;
+    const status = Number(row.status);
+    const enabled = typeof row.enabled === 'boolean'
+      ? row.enabled
+      : (!Number.isFinite(status) || status === 1);
+    output.push({ key, enabled });
+  }
+  return output;
+}
+
+async function fetchApiTokenBySession(
+  endpointBaseUrl: string,
+  headerAttempts: Array<Record<string, string>>,
+): Promise<string | null> {
+  const endpoint = normalizeEndpointBaseUrl(endpointBaseUrl);
+  if (!endpoint) return null;
+  for (const headers of headerAttempts) {
+    const response = await fetch(`${endpoint}/api/token/?p=0&size=100`, {
+      method: 'GET',
+      headers,
+    }).catch(() => null);
+    if (!response || !response.ok) continue;
+    const payload = await response.json().catch(() => null);
+    const items = extractApiTokenItemsFromPayload(payload);
+    const preferred = items.find((item) => item.enabled)?.key || items[0]?.key;
+    if (preferred) return preferred;
+  }
+  return null;
+}
+
+async function getNextAccountSortOrder(
+  db: ReturnType<typeof getCloudflareDb>,
+): Promise<number> {
+  const rows = await db
+    .select({ sortOrder: schema.accounts.sortOrder })
+    .from(schema.accounts)
+    .all();
+  const max = rows.reduce((currentMax, row) => Math.max(currentMax, row.sortOrder || 0), -1);
+  return max + 1;
+}
+
+function buildSessionVerifyHeaderAttempts(
+  site: typeof schema.sites.$inferSelect,
+  token: string,
+  platformUserId: number | null,
+): Array<Record<string, string>> {
+  const attempts: Array<Record<string, string>> = [];
+  const appendUnique = (headers: Record<string, string>) => {
+    const key = JSON.stringify(Object.entries(headers).sort(([a], [b]) => a.localeCompare(b)));
+    if (!attempts.some((item) => JSON.stringify(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) === key)) {
+      attempts.push(headers);
+    }
+  };
+  const userIdCandidates = buildVerifyUserIdCandidates(platformUserId);
+  if (platformUserId) {
+    appendUnique(buildProbeHeaders(site, token, String(platformUserId)));
+  }
+  appendUnique(buildProbeHeaders(site, token, null));
+  for (const userId of userIdCandidates) {
+    appendUnique(buildProbeHeaders(site, token, userId));
+  }
+
+  const cookieCandidates = buildSessionCookieCandidates(token);
+  for (const cookie of cookieCandidates) {
+    appendUnique({
+      Accept: 'application/json',
+      Cookie: cookie,
+      ...(platformUserId ? { 'New-Api-User': String(platformUserId), 'User-ID': String(platformUserId) } : {}),
+    });
+    for (const userId of userIdCandidates) {
+      appendUnique({
+        Accept: 'application/json',
+        Cookie: cookie,
+        'New-Api-User': userId,
+        'User-ID': userId,
+        'User-id': userId,
+      });
+    }
+    appendUnique({
+      Accept: 'application/json',
+      Cookie: cookie,
+    });
+  }
+  return attempts;
+}
+
+function buildSessionApiTokenHeaderAttempts(
+  site: typeof schema.sites.$inferSelect,
+  token: string,
+  preferredUserId: number | null,
+  preferredHeaders?: Record<string, string>,
+): Array<Record<string, string>> {
+  const attempts: Array<Record<string, string>> = [];
+  const appendUnique = (headers: Record<string, string>) => {
+    const key = JSON.stringify(Object.entries(headers).sort(([a], [b]) => a.localeCompare(b)));
+    if (!attempts.some((item) => JSON.stringify(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) === key)) {
+      attempts.push(headers);
+    }
+  };
+  if (preferredHeaders && Object.keys(preferredHeaders).length > 0) {
+    appendUnique(preferredHeaders);
+  }
+  const userIdCandidates = buildVerifyUserIdCandidates(preferredUserId);
+  if (preferredUserId) {
+    appendUnique(buildProbeHeaders(site, token, String(preferredUserId)));
+  }
+  appendUnique(buildProbeHeaders(site, token, null));
+  for (const userId of userIdCandidates) {
+    appendUnique(buildProbeHeaders(site, token, userId));
+  }
+  for (const cookie of buildSessionCookieCandidates(token)) {
+    appendUnique({
+      Accept: 'application/json',
+      Cookie: cookie,
+      ...(preferredUserId ? { 'New-Api-User': String(preferredUserId), 'User-ID': String(preferredUserId) } : {}),
+    });
+  }
+  return attempts;
+}
+
+async function performSessionTokenVerification(input: {
+  site: typeof schema.sites.$inferSelect;
+  token: string;
+  platformUserId: number | null;
+}): Promise<
+  | { success: true; result: CloudflareSessionVerifySuccess }
+  | { success: false; reason: CloudflareVerifyFailureReason; message: string }
+> {
+  const endpoint = normalizeEndpointBaseUrl(input.site.url);
+  if (!endpoint) {
+    return { success: false, reason: null, message: '站点地址无效' };
+  }
+
+  const timeoutMessage = `Token verification timed out (${Math.max(1, Math.round(ACCOUNT_VERIFY_TIMEOUT_MS / 1000))}s)`;
+  const headerAttempts = buildSessionVerifyHeaderAttempts(input.site, input.token, input.platformUserId);
+  let failureReason: CloudflareVerifyFailureReason = null;
+  let lastMessage = 'Session Token 验证失败';
+
+  for (const headers of headerAttempts) {
+    const result = await withTimeout(async () => {
+      const response = await fetch(`${endpoint}/api/user/self`, {
+        method: 'GET',
+        headers,
+      }).catch(() => null);
+      if (!response) {
+        return { ok: false as const, message: 'request failed', reason: null as CloudflareVerifyFailureReason };
+      }
+      const contentType = String(response.headers.get('content-type') || '');
+      const bodyText = await response.text();
+      const payload = parseJsonSafe(bodyText);
+      if (isShieldChallengeResponse(contentType, bodyText)) {
+        return { ok: false as const, message: 'shield challenge blocked verification', reason: 'shield-blocked' as CloudflareVerifyFailureReason };
+      }
+      if (!response.ok) {
+        const message = extractMessageFromPayload(payload) || `HTTP ${response.status}`;
+        const reason = resolveUserIdFailureReason(message, input.platformUserId != null);
+        return { ok: false as const, message, reason };
+      }
+      const data = toBalanceDataFromPayload(payload);
+      if (!data) {
+        const message = extractMessageFromPayload(payload) || '未获取到用户信息';
+        const reason = resolveUserIdFailureReason(message, input.platformUserId != null);
+        return { ok: false as const, message, reason };
+      }
+      return { ok: true as const, data, headers };
+    }, ACCOUNT_VERIFY_TIMEOUT_MS, timeoutMessage).catch((error: unknown) => ({
+      ok: false as const,
+      message: error instanceof Error ? error.message : timeoutMessage,
+      reason: null as CloudflareVerifyFailureReason,
+    }));
+
+    if (!result.ok) {
+      lastMessage = result.message || lastMessage;
+      failureReason = chooseFailureReason(failureReason, result.reason);
+      continue;
+    }
+
+    const userInfo = parseSessionVerifyDataToUserInfo(result.data);
+    const parsedUserId = parseNumericUserId(result.data.id ?? result.data.userId ?? result.data.user_id);
+    const apiToken = await fetchApiTokenBySession(
+      endpoint,
+      buildSessionApiTokenHeaderAttempts(input.site, input.token, parsedUserId ?? input.platformUserId, result.headers),
+    );
+    const balance = parseSessionVerifyBalance(result.data, String(input.site.platform || ''));
+    return {
+      success: true,
+      result: {
+        tokenType: 'session',
+        userInfo,
+        balance,
+        apiToken,
+      },
+    };
+  }
+
+  return {
+    success: false,
+    reason: failureReason,
+    message: lastMessage || 'Session Token 验证失败',
+  };
+}
+
+async function performApiKeyVerification(input: {
+  db: ReturnType<typeof getCloudflareDb>;
+  site: typeof schema.sites.$inferSelect;
+  token: string;
+  platformUserId: number | null;
+}): Promise<
+  | { success: true; models: string[] }
+  | { success: false; reason: CloudflareVerifyFailureReason; message: string }
+> {
+  const endpoints = await resolveSiteProbeEndpoints(input.db, input.site);
+  if (endpoints.length === 0) {
+    return { success: false, reason: null, message: '未配置可用站点地址' };
+  }
+
+  const primaryHeaders = buildProbeHeaders(
+    input.site,
+    input.token,
+    input.platformUserId ? String(input.platformUserId) : null,
+  );
+
+  let failureReason: CloudflareVerifyFailureReason = null;
+  let lastMessage = 'API Key 验证失败';
+  for (const endpoint of endpoints) {
+    const result = await fetchModelsViaEndpoint(endpoint, primaryHeaders, ACCOUNT_VERIFY_TIMEOUT_MS);
+    if (result.success) {
+      const deduped = [...new Map(result.models.map((model) => [model.toLowerCase(), model])).values()];
+      if (deduped.length > 0) return { success: true, models: deduped };
+      continue;
+    }
+    const userReason = resolveUserIdFailureReason(result.errorMessage, input.platformUserId != null);
+    failureReason = chooseFailureReason(failureReason, userReason);
+    if (result.upstreamMessage && /shield|challenge|captcha|acw_sc__v2|var arg1/i.test(result.upstreamMessage)) {
+      failureReason = chooseFailureReason(failureReason, 'shield-blocked');
+    }
+    lastMessage = result.errorMessage || lastMessage;
+  }
+
+  return {
+    success: false,
+    reason: failureReason,
+    message: lastMessage || 'API Key 验证失败',
+  };
+}
+
+async function performUpstreamLogin(input: {
+  site: typeof schema.sites.$inferSelect;
+  username: string;
+  password: string;
+}): Promise<{ success: true; accessToken: string } | { success: false; message: string; shieldBlocked: boolean }> {
+  const endpoint = normalizeEndpointBaseUrl(input.site.url);
+  if (!endpoint) {
+    return { success: false, message: '站点地址无效', shieldBlocked: false };
+  }
+  const payload = JSON.stringify({
+    username: input.username,
+    password: input.password,
+  });
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'X-Requested-With': 'XMLHttpRequest',
+    Accept: 'application/json',
+    ...parseStringObject(input.site.customHeaders),
+  };
+
+  try {
+    const response = await withTimeout(
+      () => fetch(`${endpoint}/api/user/login`, {
+        method: 'POST',
+        headers,
+        body: payload,
+      }),
+      ACCOUNT_LOGIN_TIMEOUT_MS,
+      `登录请求超时（${Math.max(1, Math.round(ACCOUNT_LOGIN_TIMEOUT_MS / 1000))}s）`,
+    );
+    const rawText = await response.text();
+    const contentType = String(response.headers.get('content-type') || '');
+    const parsed = parseJsonSafe(rawText);
+    if (isShieldChallengeResponse(contentType, rawText)) {
+      const normalized = normalizeLoginFailure('shield challenge blocked login');
+      return { success: false, message: normalized.message, shieldBlocked: normalized.shieldBlocked };
+    }
+    if (!response.ok) {
+      const message = extractMessageFromPayload(parsed) || `HTTP ${response.status}`;
+      const normalized = normalizeLoginFailure(message);
+      return { success: false, message: normalized.message, shieldBlocked: normalized.shieldBlocked };
+    }
+    const accessToken = extractAccessTokenFromLoginPayload(parsed);
+    const setCookieRaw = response.headers.get('set-cookie');
+    const cookieToken = sanitizeCookiePairs(setCookieRaw || '');
+    const resolvedToken = accessToken || cookieToken;
+    if (!resolvedToken) {
+      const message = extractMessageFromPayload(parsed) || '登录失败：未获取到可用会话凭据，请改用 Cookie/Token 导入';
+      const normalized = normalizeLoginFailure(message);
+      return { success: false, message: normalized.message, shieldBlocked: normalized.shieldBlocked };
+    }
+    return {
+      success: true,
+      accessToken: resolvedToken,
+    };
+  } catch (error: unknown) {
+    const normalized = normalizeLoginFailure(error instanceof Error ? error.message : '登录请求失败');
+    return { success: false, message: normalized.message, shieldBlocked: normalized.shieldBlocked };
+  }
+}
+
 type ProbeFetchResult =
   | { success: true; models: string[]; latencyMs: number; endpointUrl: string }
   | {
@@ -463,6 +1080,7 @@ type ProbeFetchResult =
     endpointUrl: string;
     latencyMs: number;
     httpStatus?: number;
+    upstreamMessage?: string;
   };
 
 async function fetchModelsViaEndpoint(
@@ -491,13 +1109,15 @@ async function fetchModelsViaEndpoint(
     }
 
     if (!response.ok) {
+      const upstreamMessage = extractMessageFromPayload(payload);
       return {
         success: false,
         endpointUrl,
         latencyMs,
         httpStatus: response.status,
         errorCode: mapProbeErrorCode(response.status),
-        errorMessage: `HTTP ${response.status}`,
+        errorMessage: upstreamMessage || `HTTP ${response.status}`,
+        upstreamMessage: upstreamMessage || undefined,
       };
     }
 
@@ -6270,64 +6890,187 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
     if (!Number.isFinite(siteId) || siteId <= 0 || !username || !password) {
       return c.json({ success: false, message: 'siteId/username/password 不能为空' }, 400);
     }
-    const inserted = await db.insert(schema.accounts).values({
-      siteId,
+    const site = await db.select().from(schema.sites).where(eq(schema.sites.id, siteId)).get();
+    if (!site) return c.json({ success: false, message: 'site not found' }, 404);
+
+    const loginResult = await performUpstreamLogin({
+      site,
       username,
-      accessToken: `login-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`,
-      status: 'active',
-      checkinEnabled: true,
-      createdAt: formatUtcSqlDateTime(),
-      updatedAt: formatUtcSqlDateTime(),
-    }).returning().get();
+      password,
+    });
+    if (!loginResult.success) {
+      return c.json({
+        success: false,
+        shieldBlocked: loginResult.shieldBlocked,
+        message: loginResult.message,
+      });
+    }
+
+    const guessedPlatformUserId = guessPlatformUserIdFromUsername(username);
+    const verifyResult = await performSessionTokenVerification({
+      site,
+      token: loginResult.accessToken,
+      platformUserId: guessedPlatformUserId,
+    });
+    const verifiedUserInfo = verifyResult.success ? verifyResult.result.userInfo : null;
+    const verifiedBalance = verifyResult.success ? verifyResult.result.balance : null;
+    const verifiedApiToken = verifyResult.success ? verifyResult.result.apiToken : null;
+    const resolvedUsername = String(verifiedUserInfo?.username || username).trim() || username;
+    const resolvedPlatformUserId = parseNumericUserId(verifiedUserInfo?.userId) ?? guessedPlatformUserId;
+
+    let existing = await db.select().from(schema.accounts).where(and(
+      eq(schema.accounts.siteId, siteId),
+      eq(schema.accounts.username, resolvedUsername),
+    )).get();
+    if (!existing && resolvedUsername !== username) {
+      existing = await db.select().from(schema.accounts).where(and(
+        eq(schema.accounts.siteId, siteId),
+        eq(schema.accounts.username, username),
+      )).get();
+    }
+
+    const nextExtraConfig = mergeAccountExtraConfig(existing?.extraConfig, {
+      credentialMode: 'session',
+      ...(resolvedPlatformUserId ? { platformUserId: resolvedPlatformUserId } : {}),
+    });
+
+    let accountId = existing?.id || 0;
+    if (existing) {
+      await db.update(schema.accounts).set({
+        username: resolvedUsername,
+        accessToken: loginResult.accessToken,
+        ...(verifiedApiToken ? { apiToken: verifiedApiToken } : {}),
+        ...(verifiedBalance
+          ? {
+            balance: verifiedBalance.balance,
+            balanceUsed: Number.isFinite(Number(verifiedBalance.used)) ? Number(verifiedBalance.used) : existing.balanceUsed,
+            quota: Number.isFinite(Number(verifiedBalance.quota)) ? Number(verifiedBalance.quota) : existing.quota,
+          }
+          : {}),
+        status: 'active',
+        checkinEnabled: true,
+        extraConfig: nextExtraConfig,
+        updatedAt: formatUtcSqlDateTime(),
+      }).where(eq(schema.accounts.id, existing.id)).run();
+      accountId = existing.id;
+    } else {
+      const sortOrder = await getNextAccountSortOrder(db);
+      const created = await db.insert(schema.accounts).values({
+        siteId,
+        username: resolvedUsername,
+        accessToken: loginResult.accessToken,
+        apiToken: verifiedApiToken || null,
+        ...(verifiedBalance
+          ? {
+            balance: verifiedBalance.balance,
+            balanceUsed: Number.isFinite(Number(verifiedBalance.used)) ? Number(verifiedBalance.used) : 0,
+            quota: Number.isFinite(Number(verifiedBalance.quota)) ? Number(verifiedBalance.quota) : 0,
+          }
+          : {}),
+        status: 'active',
+        checkinEnabled: true,
+        extraConfig: nextExtraConfig,
+        isPinned: false,
+        sortOrder,
+        createdAt: formatUtcSqlDateTime(),
+        updatedAt: formatUtcSqlDateTime(),
+      }).returning().get();
+      accountId = created.id;
+    }
+
+    const account = await db.select().from(schema.accounts).where(eq(schema.accounts.id, accountId)).get();
     return c.json({
       success: true,
-      account: inserted,
-      message: 'Cloudflare Worker 版本已模拟登录并创建账号',
+      account: account || null,
+      apiTokenFound: !!String(verifiedApiToken || account?.apiToken || '').trim(),
+      tokenCount: String(verifiedApiToken || account?.apiToken || '').trim() ? 1 : 0,
+      reusedAccount: !!existing,
     });
   });
 
   app.post('/api/accounts/verify-token', async (c) => {
+    const db = getCloudflareDb(c);
     const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
     const siteId = Math.trunc(Number(body.siteId));
     const accessToken = String(body.accessToken || '').trim();
     if (!Number.isFinite(siteId) || siteId <= 0 || !accessToken) {
       return c.json({ success: false, message: 'siteId/accessToken 不能为空' }, 400);
     }
-    const credentialMode = String(body.credentialMode || '').trim().toLowerCase();
+    const site = await db.select().from(schema.sites).where(eq(schema.sites.id, siteId)).get();
+    if (!site) return c.json({ success: false, message: 'site not found' }, 404);
+
+    const credentialMode = resolveRequestedCredentialMode(body.credentialMode);
     const looksLikeApiKey = /^sk-[A-Za-z0-9_\-]{4,}/.test(accessToken);
     const tokenType = credentialMode === 'session'
       ? 'session'
       : credentialMode === 'apikey'
         ? 'apikey'
         : (looksLikeApiKey ? 'apikey' : 'session');
+    const platformUserId = parseNumericUserId(body.platformUserId);
 
     if (tokenType === 'session') {
-      const usernameFromBody = String(body.username || '').trim();
-      const platformUserId = Math.trunc(Number(body.platformUserId));
-      const normalizedUserId = Number.isFinite(platformUserId) && platformUserId > 0
-        ? String(platformUserId)
-        : null;
-      return c.json({
-        success: true,
-        tokenType: 'session',
-        userInfo: {
-          username: usernameFromBody || `session-${accessToken.slice(0, 8)}`,
-          ...(normalizedUserId ? { userId: normalizedUserId } : {}),
-        },
-        balance: {
-          balance: 0,
-        },
-        apiToken: null,
-        message: 'Session Token 验证通过（Cloudflare 本地校验）',
+      const sessionVerify = await performSessionTokenVerification({
+        site,
+        token: accessToken,
+        platformUserId,
       });
+      if (sessionVerify.success) {
+        return c.json({
+          success: true,
+          tokenType: 'session',
+          userInfo: sessionVerify.result.userInfo,
+          balance: sessionVerify.result.balance,
+          apiToken: sessionVerify.result.apiToken,
+        });
+      }
+      if (credentialMode === 'auto') {
+        const apiKeyFallback = await performApiKeyVerification({
+          db,
+          site,
+          token: accessToken,
+          platformUserId,
+        });
+        if (apiKeyFallback.success) {
+          return c.json({
+            success: true,
+            tokenType: 'apikey',
+            modelCount: apiKeyFallback.models.length,
+            models: apiKeyFallback.models.slice(0, 10),
+          });
+        }
+        const failurePayload = buildVerificationFailurePayload(
+          chooseFailureReason(sessionVerify.reason, apiKeyFallback.reason),
+        );
+        if (failurePayload) return c.json(failurePayload);
+        return c.json({
+          success: false,
+          message: apiKeyFallback.message || sessionVerify.message || 'Token invalid: cannot use it as session cookie or API key',
+        });
+      }
+      const failurePayload = buildVerificationFailurePayload(sessionVerify.reason);
+      if (failurePayload) return c.json(failurePayload);
+      return c.json({ success: false, message: sessionVerify.message || 'Session Token 验证失败' });
     }
 
+    const apiKeyVerify = await performApiKeyVerification({
+      db,
+      site,
+      token: accessToken,
+      platformUserId,
+    });
+    if (apiKeyVerify.success) {
+      return c.json({
+        success: true,
+        tokenType: 'apikey',
+        modelCount: apiKeyVerify.models.length,
+        models: apiKeyVerify.models.slice(0, 10),
+      });
+    }
+    const failurePayload = buildVerificationFailurePayload(apiKeyVerify.reason);
+    if (failurePayload) return c.json(failurePayload);
     return c.json({
-      success: true,
-      tokenType: 'apikey',
-      modelCount: 0,
-      models: [],
-      message: 'API Key 验证通过（Cloudflare 本地校验）',
+      success: false,
+      message: apiKeyVerify.message || 'API Key 验证失败',
     });
   });
 
