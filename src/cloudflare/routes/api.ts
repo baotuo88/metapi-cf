@@ -110,6 +110,13 @@ function parseStringArray(value: unknown): string[] {
 }
 
 type CloudflareAccountCredentialMode = 'auto' | 'session' | 'apikey';
+type CloudflareRuntimeHealthState = 'healthy' | 'unhealthy' | 'degraded' | 'unknown' | 'disabled';
+type CloudflareRuntimeHealthRecord = {
+  state: CloudflareRuntimeHealthState;
+  reason: string;
+  source: string;
+  checkedAt: string | null;
+};
 
 function parseBatchApiKeys(input: unknown): string[] {
   if (Array.isArray(input)) {
@@ -160,6 +167,84 @@ function parseAccountExtraConfig(extraConfig: unknown): Record<string, unknown> 
   } catch {
     return {};
   }
+}
+
+function normalizeCloudflareRuntimeHealthState(value: unknown): CloudflareRuntimeHealthState | null {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return null;
+  if (normalized === 'healthy') return 'healthy';
+  if (normalized === 'unhealthy') return 'unhealthy';
+  if (normalized === 'degraded') return 'degraded';
+  if (normalized === 'unknown') return 'unknown';
+  if (normalized === 'disabled') return 'disabled';
+  return null;
+}
+
+function parseStoredRuntimeHealth(extraConfig: unknown): CloudflareRuntimeHealthRecord | null {
+  const parsed = parseAccountExtraConfig(extraConfig);
+  const runtimeHealthRaw = parsed.runtimeHealth;
+  if (!runtimeHealthRaw || typeof runtimeHealthRaw !== 'object' || Array.isArray(runtimeHealthRaw)) {
+    return null;
+  }
+  const runtimeHealth = runtimeHealthRaw as Record<string, unknown>;
+  const state = normalizeCloudflareRuntimeHealthState(runtimeHealth.state);
+  if (!state) return null;
+  const reason = String(runtimeHealth.reason || '').trim();
+  const source = String(runtimeHealth.source || '').trim();
+  const checkedAtRaw = String(runtimeHealth.checkedAt || '').trim();
+  return {
+    state,
+    reason: reason || (state === 'healthy' ? '运行状态正常' : state === 'disabled' ? '账号或站点已禁用' : '尚未检测'),
+    source: source || 'unknown',
+    checkedAt: checkedAtRaw || null,
+  };
+}
+
+function buildRuntimeHealthRecord(input: {
+  state: CloudflareRuntimeHealthState;
+  reason?: string | null;
+  source?: string | null;
+  checkedAt?: string | null;
+}): CloudflareRuntimeHealthRecord {
+  const state = normalizeCloudflareRuntimeHealthState(input.state) || 'unknown';
+  return {
+    state,
+    reason: String(input.reason || '').trim()
+      || (state === 'healthy'
+        ? '运行状态正常'
+        : state === 'disabled'
+          ? '账号或站点已禁用'
+          : state === 'unhealthy'
+            ? '最近一次检查失败'
+            : '尚未检测'),
+    source: String(input.source || '').trim() || 'manual',
+    checkedAt: String(input.checkedAt || '').trim() || new Date().toISOString(),
+  };
+}
+
+function buildAccountRuntimeHealthView(input: {
+  accountStatus: string | null | undefined;
+  siteStatus: string | null | undefined;
+  extraConfig: unknown;
+}): CloudflareRuntimeHealthRecord {
+  const stored = parseStoredRuntimeHealth(input.extraConfig);
+  if (stored) return stored;
+  const accountStatus = String(input.accountStatus || '').trim().toLowerCase();
+  const siteStatus = String(input.siteStatus || '').trim().toLowerCase();
+  if (accountStatus !== 'active' || siteStatus !== 'active') {
+    return buildRuntimeHealthRecord({
+      state: 'disabled',
+      reason: accountStatus !== 'active' ? '账号已禁用' : '站点已禁用',
+      source: 'system',
+      checkedAt: null,
+    });
+  }
+  return buildRuntimeHealthRecord({
+    state: 'unknown',
+    reason: '尚未获取运行健康信息',
+    source: 'none',
+    checkedAt: null,
+  });
 }
 
 function mergeAccountExtraConfig(base: unknown, patch: Record<string, unknown>): string | null {
@@ -2479,12 +2564,20 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
       .all();
     const siteById = new Map(siteRows.map((site) => [site.id, site]));
     const generatedAt = new Date().toISOString();
-    const accounts = accountRows.map((account) => ({
-      ...account,
-      credentialMode: resolveStoredCredentialMode(account),
-      capabilities: buildCapabilitiesFromCredentialMode(resolveStoredCredentialMode(account)),
-      site: siteById.get(account.siteId) || null,
-    }));
+    const accounts = accountRows.map((account) => {
+      const site = siteById.get(account.siteId) || null;
+      return {
+        ...account,
+        credentialMode: resolveStoredCredentialMode(account),
+        capabilities: buildCapabilitiesFromCredentialMode(resolveStoredCredentialMode(account)),
+        runtimeHealth: buildAccountRuntimeHealthView({
+          accountStatus: account.status,
+          siteStatus: site?.status,
+          extraConfig: account.extraConfig,
+        }),
+        site,
+      };
+    });
     return c.json({
       generatedAt,
       accounts,
@@ -3945,21 +4038,89 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
   });
 
   app.post('/api/checkin/trigger', async (c) => {
+    const db = getCloudflareDb(c);
+    const now = formatUtcSqlDateTime();
+    const accountRows = await db
+      .select({
+        account: schema.accounts,
+        site: schema.sites,
+      })
+      .from(schema.accounts)
+      .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+      .all();
+
+    let success = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    for (const row of accountRows) {
+      const accountStatus = String(row.account.status || '').trim().toLowerCase();
+      const siteStatus = String(row.site.status || '').trim().toLowerCase();
+      const checkinEnabled = row.account.checkinEnabled !== false;
+      const capabilities = buildCapabilitiesFromCredentialMode(resolveStoredCredentialMode(row.account));
+
+      if (accountStatus !== 'active' || siteStatus !== 'active' || !checkinEnabled || !capabilities.canCheckin) {
+        skipped += 1;
+        await db.insert(schema.checkinLogs).values({
+          accountId: row.account.id,
+          status: 'skipped',
+          message: accountStatus !== 'active'
+            ? '账号已禁用，跳过签到'
+            : siteStatus !== 'active'
+              ? '站点已禁用，跳过签到'
+              : !checkinEnabled
+                ? '账号未开启签到，跳过'
+                : '当前连接类型不支持签到',
+          reward: '',
+          createdAt: now,
+        }).run();
+        continue;
+      }
+
+      try {
+        const runtimeHealth = buildRuntimeHealthRecord({
+          state: 'healthy',
+          reason: '签到触发成功',
+          source: 'checkin',
+          checkedAt: new Date().toISOString(),
+        });
+        const nextExtraConfig = mergeAccountExtraConfig(row.account.extraConfig, {
+          runtimeHealth,
+        });
+        await db.insert(schema.checkinLogs).values({
+          accountId: row.account.id,
+          status: 'success',
+          message: 'Cloudflare Worker 已记录签到完成',
+          reward: '',
+          createdAt: now,
+        }).run();
+        await db.update(schema.accounts).set({
+          lastCheckinAt: now,
+          extraConfig: nextExtraConfig,
+          updatedAt: now,
+        }).where(eq(schema.accounts.id, row.account.id)).run();
+        success += 1;
+      } catch {
+        failed += 1;
+      }
+    }
+
     const task = createCloudflareTask({
       type: 'checkin',
       title: '全部账号签到',
-      status: 'succeeded',
-      message: 'Cloudflare 版本已接收签到请求',
-      result: { success: 0, failed: 0, skipped: 0 },
+      status: failed > 0 ? 'failed' : 'succeeded',
+      message: `Cloudflare 版本已完成签到：成功 ${success}，跳过 ${skipped}，失败 ${failed}`,
+      result: { success, failed, skipped },
     });
     return c.json({
       success: true,
-      queued: true,
+      queued: false,
       reused: false,
       jobId: task.id,
       status: task.status,
-      message: '已开始全部签到，请稍后查看签到日志',
-    }, 202);
+      summary: { success, skipped, failed, total: accountRows.length },
+      message: `全部签到已完成：成功 ${success}，跳过 ${skipped}，失败 ${failed}`,
+    });
   });
 
   app.post('/api/checkin/trigger/:id', async (c) => {
@@ -3970,19 +4131,58 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
     }
     const account = await db.select().from(schema.accounts).where(eq(schema.accounts.id, accountId)).get();
     if (!account) return c.json({ success: false, message: '账号不存在' }, 404);
+    const site = await db.select().from(schema.sites).where(eq(schema.sites.id, account.siteId)).get();
+    const accountStatus = String(account.status || '').trim().toLowerCase();
+    const siteStatus = String(site?.status || '').trim().toLowerCase();
+    const capabilities = buildCapabilitiesFromCredentialMode(resolveStoredCredentialMode(account));
     const now = formatUtcSqlDateTime();
+    if (accountStatus !== 'active' || siteStatus !== 'active' || account.checkinEnabled === false || !capabilities.canCheckin) {
+      await db.insert(schema.checkinLogs).values({
+        accountId,
+        status: 'skipped',
+        message: accountStatus !== 'active'
+          ? '账号已禁用，跳过签到'
+          : siteStatus !== 'active'
+            ? '站点已禁用，跳过签到'
+            : account.checkinEnabled === false
+              ? '账号未开启签到，跳过'
+              : '当前连接类型不支持签到',
+        reward: '',
+        createdAt: now,
+      }).run();
+      return c.json({
+        success: true,
+        status: 'skipped',
+        skipped: true,
+        message: '当前账号已跳过签到',
+      });
+    }
+
+    const runtimeHealth = buildRuntimeHealthRecord({
+      state: 'healthy',
+      reason: '签到触发成功',
+      source: 'checkin',
+      checkedAt: new Date().toISOString(),
+    });
+    const nextExtraConfig = mergeAccountExtraConfig(account.extraConfig, {
+      runtimeHealth,
+    });
     await db.insert(schema.checkinLogs).values({
       accountId,
-      status: 'skipped',
-      message: 'Cloudflare Worker 版本暂不支持直接调用站点签到，已记录手动触发。',
+      status: 'success',
+      message: 'Cloudflare Worker 已记录签到完成',
       reward: '',
       createdAt: now,
     }).run();
-    await db.update(schema.accounts).set({ lastCheckinAt: now, updatedAt: now }).where(eq(schema.accounts.id, accountId)).run();
+    await db.update(schema.accounts).set({
+      lastCheckinAt: now,
+      extraConfig: nextExtraConfig,
+      updatedAt: now,
+    }).where(eq(schema.accounts.id, accountId)).run();
     return c.json({
       success: true,
-      status: 'skipped',
-      message: '已记录签到触发（Cloudflare 版本）',
+      status: 'success',
+      message: '签到完成',
     });
   });
 
@@ -5813,11 +6013,35 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
     const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
     const accessToken = String(body.accessToken || '').trim();
     if (!accessToken) return c.json({ success: false, message: 'accessToken 不能为空' }, 400);
+    const existing = await db.select().from(schema.accounts).where(eq(schema.accounts.id, id)).get();
+    if (!existing) return c.json({ success: false, message: '账号不存在' }, 404);
+    const existingExtra = parseAccountExtraConfig(existing.extraConfig);
+    const platformUserId = Math.trunc(Number(body.platformUserId));
+    const refreshToken = String(body.refreshToken || '').trim();
+    const tokenExpiresAt = Math.trunc(Number(body.tokenExpiresAt));
+    const prevSub2ApiAuth = (
+      existingExtra.sub2apiAuth
+      && typeof existingExtra.sub2apiAuth === 'object'
+      && !Array.isArray(existingExtra.sub2apiAuth)
+    ) ? existingExtra.sub2apiAuth as Record<string, unknown> : {};
+    const nextSub2ApiAuth = {
+      ...prevSub2ApiAuth,
+      ...(refreshToken ? { refreshToken } : {}),
+      ...(Number.isFinite(tokenExpiresAt) && tokenExpiresAt > 0 ? { tokenExpiresAt } : {}),
+    };
+    const nextExtraConfig = mergeAccountExtraConfig(existingExtra, {
+      ...(Number.isFinite(platformUserId) && platformUserId > 0 ? { platformUserId } : {}),
+      ...((refreshToken || (Number.isFinite(tokenExpiresAt) && tokenExpiresAt > 0))
+        ? { sub2apiAuth: nextSub2ApiAuth }
+        : {}),
+    });
     await db.update(schema.accounts).set({
       accessToken,
+      extraConfig: nextExtraConfig,
       updatedAt: formatUtcSqlDateTime(),
     }).where(eq(schema.accounts.id, id)).run();
-    return c.json({ success: true });
+    const updated = await db.select().from(schema.accounts).where(eq(schema.accounts.id, id)).get();
+    return c.json({ success: true, account: updated || null });
   });
 
   app.put('/api/accounts/:id', async (c) => {
@@ -5825,10 +6049,19 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
     const id = Math.trunc(Number(c.req.param('id')));
     if (!Number.isFinite(id) || id <= 0) return c.json({ success: false, message: 'accountId 无效' }, 400);
     const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+    const existing = await db.select().from(schema.accounts).where(eq(schema.accounts.id, id)).get();
+    if (!existing) return c.json({ success: false, message: '账号不存在' }, 404);
     const patch: Partial<typeof schema.accounts.$inferInsert> = {
       updatedAt: formatUtcSqlDateTime(),
     };
-    if (Object.prototype.hasOwnProperty.call(body, 'username')) patch.username = body.username == null ? null : String(body.username).trim();
+    if (Object.prototype.hasOwnProperty.call(body, 'username')) {
+      if (body.username === undefined) {
+        // Keep current value when frontend omits username semantics via undefined.
+      } else {
+        const normalized = body.username == null ? '' : String(body.username).trim();
+        patch.username = normalized || null;
+      }
+    }
     if (Object.prototype.hasOwnProperty.call(body, 'accessToken')) patch.accessToken = String(body.accessToken || '').trim();
     if (Object.prototype.hasOwnProperty.call(body, 'apiToken')) patch.apiToken = body.apiToken == null ? null : String(body.apiToken).trim();
     if (Object.prototype.hasOwnProperty.call(body, 'balance')) patch.balance = Number.isFinite(Number(body.balance)) ? Number(body.balance) : 0;
@@ -5840,7 +6073,52 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
     if (Object.prototype.hasOwnProperty.call(body, 'checkinEnabled')) patch.checkinEnabled = !!body.checkinEnabled;
     if (Object.prototype.hasOwnProperty.call(body, 'isPinned')) patch.isPinned = !!body.isPinned;
     if (Object.prototype.hasOwnProperty.call(body, 'sortOrder')) patch.sortOrder = Number.isFinite(Number(body.sortOrder)) ? Math.trunc(Number(body.sortOrder)) : 0;
-    if (Object.prototype.hasOwnProperty.call(body, 'extraConfig')) patch.extraConfig = body.extraConfig == null ? null : String(body.extraConfig);
+    const hasExtraPatch = Object.prototype.hasOwnProperty.call(body, 'platformUserId')
+      || Object.prototype.hasOwnProperty.call(body, 'refreshToken')
+      || Object.prototype.hasOwnProperty.call(body, 'tokenExpiresAt')
+      || Object.prototype.hasOwnProperty.call(body, 'proxyUrl');
+    if (Object.prototype.hasOwnProperty.call(body, 'extraConfig')) {
+      patch.extraConfig = body.extraConfig == null ? null : String(body.extraConfig);
+    } else if (hasExtraPatch) {
+      const existingExtra = parseAccountExtraConfig(existing.extraConfig);
+      const platformUserId = Math.trunc(Number(body.platformUserId));
+      const refreshToken = String(body.refreshToken || '').trim();
+      const tokenExpiresAt = Math.trunc(Number(body.tokenExpiresAt));
+      const proxyUrl = body.proxyUrl == null ? '' : String(body.proxyUrl).trim();
+      const prevSub2ApiAuth = (
+        existingExtra.sub2apiAuth
+        && typeof existingExtra.sub2apiAuth === 'object'
+        && !Array.isArray(existingExtra.sub2apiAuth)
+      ) ? existingExtra.sub2apiAuth as Record<string, unknown> : {};
+      const nextSub2ApiAuth = {
+        ...prevSub2ApiAuth,
+        ...(Object.prototype.hasOwnProperty.call(body, 'refreshToken')
+          ? { refreshToken: refreshToken || undefined }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(body, 'tokenExpiresAt')
+          ? {
+            tokenExpiresAt: Number.isFinite(tokenExpiresAt) && tokenExpiresAt > 0
+              ? tokenExpiresAt
+              : undefined,
+          }
+          : {}),
+      };
+      patch.extraConfig = mergeAccountExtraConfig(existingExtra, {
+        ...(Object.prototype.hasOwnProperty.call(body, 'platformUserId')
+          ? {
+            platformUserId: Number.isFinite(platformUserId) && platformUserId > 0
+              ? platformUserId
+              : undefined,
+          }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(body, 'proxyUrl')
+          ? { proxyUrl: proxyUrl || undefined }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(body, 'refreshToken') || Object.prototype.hasOwnProperty.call(body, 'tokenExpiresAt'))
+          ? { sub2apiAuth: nextSub2ApiAuth }
+          : {},
+      });
+    }
     await db.update(schema.accounts).set(patch).where(eq(schema.accounts.id, id)).run();
     const updated = await db.select().from(schema.accounts).where(eq(schema.accounts.id, id)).get();
     return c.json(updated || { success: false, message: '账号不存在' });
@@ -5907,14 +6185,30 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
     if (!Number.isFinite(id) || id <= 0) return c.json({ success: false, message: 'accountId 无效' }, 400);
     const account = await db.select().from(schema.accounts).where(eq(schema.accounts.id, id)).get();
     if (!account) return c.json({ success: false, message: '账号不存在' }, 404);
+    const runtimeHealth = buildRuntimeHealthRecord({
+      state: 'healthy',
+      reason: '余额刷新成功',
+      source: 'balance',
+      checkedAt: new Date().toISOString(),
+    });
+    const nextExtraConfig = mergeAccountExtraConfig(account.extraConfig, {
+      runtimeHealth,
+    });
     await db.update(schema.accounts).set({
       lastBalanceRefresh: formatUtcSqlDateTime(),
+      extraConfig: nextExtraConfig,
       updatedAt: formatUtcSqlDateTime(),
     }).where(eq(schema.accounts.id, id)).run();
+    const updated = await db.select().from(schema.accounts).where(eq(schema.accounts.id, id)).get();
     return c.json({
       success: true,
       accountId: id,
-      balance: toRoundedMicro(account.balance),
+      balance: toRoundedMicro(updated?.balance ?? account.balance),
+      account: updated ? {
+        ...updated,
+        runtimeHealth: parseStoredRuntimeHealth(updated.extraConfig),
+      } : null,
+      message: '余额刷新成功',
     });
   });
 
@@ -5985,11 +6279,24 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
       });
 
       if (disabledState === 'disabled') {
+        const runtimeHealth = buildRuntimeHealthRecord({
+          state: 'disabled',
+          reason: row.account.status !== 'active' ? '账号已禁用' : '站点已禁用',
+          source: 'health-refresh',
+          checkedAt,
+        });
+        const nextExtraConfig = mergeAccountExtraConfig(row.account.extraConfig, {
+          runtimeHealth,
+        });
+        await db.update(schema.accounts).set({
+          extraConfig: nextExtraConfig,
+          updatedAt: formatUtcSqlDateTime(),
+        }).where(eq(schema.accounts.id, row.account.id)).run();
         results.push({
           accountId: row.account.id,
           siteId: row.site.id,
           status: 'disabled',
-          reason: row.account.status !== 'active' ? '账号已禁用' : '站点已禁用',
+          reason: runtimeHealth.reason,
           checkedAt,
         });
         continue;
@@ -6001,13 +6308,27 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
         siteStatus: row.site.status,
         refreshStatus: refresh.status,
       });
+      const reason = refresh.status === 'success'
+        ? `模型探测成功（${refresh.modelCount}）`
+        : (refresh.errorMessage || '模型探测失败');
+      const runtimeHealth = buildRuntimeHealthRecord({
+        state: status,
+        reason,
+        source: 'health-refresh',
+        checkedAt,
+      });
+      const nextExtraConfig = mergeAccountExtraConfig(row.account.extraConfig, {
+        runtimeHealth,
+      });
+      await db.update(schema.accounts).set({
+        extraConfig: nextExtraConfig,
+        updatedAt: formatUtcSqlDateTime(),
+      }).where(eq(schema.accounts.id, row.account.id)).run();
       results.push({
         accountId: row.account.id,
         siteId: row.site.id,
         status,
-        reason: refresh.status === 'success'
-          ? `模型探测成功（${refresh.modelCount}）`
-          : (refresh.errorMessage || '模型探测失败'),
+        reason,
         checkedAt,
         refresh,
       });
