@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import type { CloudflareEnv } from './env.js';
 import { settings } from '../server/db/schema.js';
-import { ensureD1Bootstrap } from './db/d1.js';
+import { ensureD1Bootstrap, getD1BootstrapState } from './db/d1.js';
 import { registerAuthRoutes } from './routes/auth.js';
 import { registerCoreApiRoutes } from './routes/api.js';
 import { registerMonitorRoutes } from './routes/monitor.js';
@@ -17,6 +17,7 @@ const app = new Hono<CloudflareHonoEnv>();
 
 app.get('/api/cloudflare/health', async (c) => {
   const db = getCloudflareDb(c);
+  const bootstrapState = getD1BootstrapState(c.env.METAPI_DB);
   const settingsProbe = await db
     .select()
     .from(settings)
@@ -37,6 +38,7 @@ app.get('/api/cloudflare/health', async (c) => {
     probes: {
       d1SchemaReadable: settingsProbe,
     },
+    bootstrap: bootstrapState,
   });
 });
 
@@ -61,11 +63,19 @@ app.notFound((c) => c.json({
 
 const handler: ExportedHandler<CloudflareEnv> = {
   fetch: async (request, env, ctx) => {
-    await ensureD1Bootstrap(env.METAPI_DB);
+    ctx.waitUntil(
+      ensureD1Bootstrap(env.METAPI_DB).catch((error) => {
+        console.error('[cloudflare] D1 bootstrap failed', error);
+      }),
+    );
     return app.fetch(request, env, ctx);
   },
   scheduled: async (_controller, env, ctx) => {
-    await ensureD1Bootstrap(env.METAPI_DB);
+    ctx.waitUntil(
+      ensureD1Bootstrap(env.METAPI_DB).catch((error) => {
+        console.error('[cloudflare] D1 bootstrap failed (scheduled)', error);
+      }),
+    );
     ctx.waitUntil(Promise.resolve(env));
   },
 };
