@@ -721,9 +721,9 @@ function parseSessionVerifyDataToUserInfo(data: Record<string, unknown>): {
   const userIdValue = data.id ?? data.userId ?? data.user_id;
   const userId = parseNumericUserId(userIdValue);
   const displayName = String(data.display_name ?? data.displayName ?? '').trim();
+  const usernameCandidate = displayName || data.username;
   const username = String(
-    displayName
-    || data.username
+    usernameCandidate
     ?? data.email
     ?? (userId ? `user-${userId}` : ''),
   ).trim() || (userId ? `user-${userId}` : 'unknown-user');
