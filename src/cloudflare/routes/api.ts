@@ -9,6 +9,11 @@ import {
   writeSetting,
   type CloudflareHonoEnv,
 } from '../shared/http.js';
+import {
+  parseUpdateCenterConfigPayload,
+  parseUpdateCenterDeployPayload,
+  parseUpdateCenterRollbackPayload,
+} from '../../server/contracts/supportRoutePayloads.js';
 
 type SiteAvailabilityBucket = {
   startUtc: string;
@@ -3291,6 +3296,7 @@ type CloudflareTaskRow = {
   title: string;
   status: CloudflareTaskStatus;
   message: string;
+  logs: Array<{ message: string; createdAt: string }>;
   error: unknown | null;
   result: unknown;
   createdAt: string;
@@ -3319,6 +3325,9 @@ function createCloudflareTask(input: {
     title: input.title,
     status,
     message: input.message || '',
+    logs: input.message
+      ? [{ message: input.message, createdAt: now }]
+      : [],
     error: input.error || null,
     result: input.result,
     createdAt: now,
@@ -3337,6 +3346,7 @@ function updateCloudflareTask(id: string, patch: Partial<CloudflareTaskRow>): Cl
     ...current,
     ...patch,
     status: nextStatus,
+    logs: patch.logs || current.logs,
     updatedAt: new Date().toISOString(),
     finishedAt: ['succeeded', 'failed', 'cancelled'].includes(nextStatus)
       ? (patch.finishedAt || new Date().toISOString())
@@ -3344,6 +3354,22 @@ function updateCloudflareTask(id: string, patch: Partial<CloudflareTaskRow>): Cl
   };
   cloudflareTaskStore.set(id, next);
   return next;
+}
+
+function appendCloudflareTaskLog(id: string, message: string): void {
+  const text = String(message || '').trim();
+  if (!text) return;
+  const current = cloudflareTaskStore.get(id);
+  if (!current) return;
+  const createdAt = new Date().toISOString();
+  const logs = [...current.logs, { message: text, createdAt }];
+  const cappedLogs = logs.slice(-400);
+  cloudflareTaskStore.set(id, {
+    ...current,
+    logs: cappedLogs,
+    message: text,
+    updatedAt: createdAt,
+  });
 }
 
 function parseStoredDateToTimestamp(raw: string | null | undefined): number {
@@ -3469,6 +3495,906 @@ type CloudflareOauthSession = {
 };
 
 const cloudflareOauthSessions = new Map<string, CloudflareOauthSession>();
+
+type CloudflareUpdateCenterVersionSource = 'github-release' | 'docker-hub-tag';
+
+type CloudflareUpdateCenterConfig = {
+  enabled: boolean;
+  helperBaseUrl: string;
+  namespace: string;
+  releaseName: string;
+  chartRef: string;
+  imageRepository: string;
+  githubReleasesEnabled: boolean;
+  dockerHubTagsEnabled: boolean;
+  defaultDeploySource: CloudflareUpdateCenterVersionSource;
+};
+
+type CloudflareUpdateCenterVersionCandidate = {
+  source: CloudflareUpdateCenterVersionSource;
+  rawVersion: string;
+  normalizedVersion: string;
+  url: string | null;
+  tagName?: string | null;
+  digest?: string | null;
+  displayVersion?: string | null;
+  publishedAt?: string | null;
+};
+
+type CloudflareUpdateCenterHelperStatus = {
+  ok: boolean;
+  releaseName: string | null;
+  namespace: string | null;
+  revision: string | null;
+  imageRepository: string | null;
+  imageTag: string | null;
+  imageDigest: string | null;
+  healthy: boolean;
+  history?: Array<{
+    revision: string;
+    updatedAt: string | null;
+    status: string | null;
+    description: string | null;
+    imageRepository: string | null;
+    imageTag: string | null;
+    imageDigest: string | null;
+  }>;
+  error?: string;
+};
+
+type CloudflareUpdateCenterStatusSnapshot = {
+  githubRelease: CloudflareUpdateCenterVersionCandidate | null;
+  dockerHubTag: CloudflareUpdateCenterVersionCandidate | null;
+  dockerHubRecentTags: CloudflareUpdateCenterVersionCandidate[];
+  helper: CloudflareUpdateCenterHelperStatus | null;
+};
+
+type CloudflareUpdateCenterRuntimeState = {
+  lastCheckedAt: string | null;
+  lastCheckError: string | null;
+  lastResolvedSource: CloudflareUpdateCenterVersionSource | null;
+  lastResolvedDisplayVersion: string | null;
+  lastResolvedCandidateKey: string | null;
+  lastNotifiedCandidateKey: string | null;
+  lastNotifiedAt: string | null;
+  statusSnapshot: CloudflareUpdateCenterStatusSnapshot | null;
+};
+
+const UPDATE_CENTER_CONFIG_SETTING_KEY = 'update_center_k3s_config_v1';
+const UPDATE_CENTER_RUNTIME_STATE_SETTING_KEY = 'update_center_runtime_state_v1';
+const UPDATE_CENTER_DEPLOY_TASK_TYPE = 'update-center.deploy';
+const UPDATE_CENTER_GITHUB_RELEASES_URL = 'https://api.github.com/repos/cita-777/metapi/releases';
+const UPDATE_CENTER_DOCKER_HUB_TAGS_URL = 'https://hub.docker.com/v2/repositories/1467078763/metapi/tags?page_size=100';
+const UPDATE_CENTER_FETCH_TIMEOUT_MS = 12_000;
+const UPDATE_CENTER_STABLE_SEMVER = /^v?(\d+)\.(\d+)\.(\d+)(?:\+[\w.-]+)?$/i;
+
+function getDefaultCloudflareUpdateCenterConfig(): CloudflareUpdateCenterConfig {
+  return {
+    enabled: false,
+    helperBaseUrl: '',
+    namespace: 'default',
+    releaseName: '',
+    chartRef: '',
+    imageRepository: '1467078763/metapi',
+    githubReleasesEnabled: true,
+    dockerHubTagsEnabled: true,
+    defaultDeploySource: 'github-release',
+  };
+}
+
+function normalizeUpdateCenterConfig(input: unknown): CloudflareUpdateCenterConfig {
+  const defaults = getDefaultCloudflareUpdateCenterConfig();
+  const record = safeJsonObject(input);
+  const defaultDeploySource = record.defaultDeploySource === 'docker-hub-tag'
+    ? 'docker-hub-tag'
+    : 'github-release';
+  return {
+    enabled: typeof record.enabled === 'boolean' ? record.enabled : defaults.enabled,
+    helperBaseUrl: String(record.helperBaseUrl || '').trim(),
+    namespace: String(record.namespace || '').trim() || defaults.namespace,
+    releaseName: String(record.releaseName || '').trim(),
+    chartRef: String(record.chartRef || '').trim(),
+    imageRepository: String(record.imageRepository || '').trim() || defaults.imageRepository,
+    githubReleasesEnabled: typeof record.githubReleasesEnabled === 'boolean' ? record.githubReleasesEnabled : defaults.githubReleasesEnabled,
+    dockerHubTagsEnabled: typeof record.dockerHubTagsEnabled === 'boolean' ? record.dockerHubTagsEnabled : defaults.dockerHubTagsEnabled,
+    defaultDeploySource,
+  };
+}
+
+function getDefaultCloudflareUpdateCenterRuntimeState(): CloudflareUpdateCenterRuntimeState {
+  return {
+    lastCheckedAt: null,
+    lastCheckError: null,
+    lastResolvedSource: null,
+    lastResolvedDisplayVersion: null,
+    lastResolvedCandidateKey: null,
+    lastNotifiedCandidateKey: null,
+    lastNotifiedAt: null,
+    statusSnapshot: null,
+  };
+}
+
+function normalizeNullableText(value: unknown): string | null {
+  const text = typeof value === 'string' ? value.trim() : '';
+  return text || null;
+}
+
+function normalizeUpdateCenterVersionSource(value: unknown): CloudflareUpdateCenterVersionSource | null {
+  return value === 'docker-hub-tag' || value === 'github-release' ? value : null;
+}
+
+function normalizeUpdateCenterVersionCandidate(value: unknown): CloudflareUpdateCenterVersionCandidate | null {
+  const record = safeJsonObject(value);
+  const source = normalizeUpdateCenterVersionSource(record.source);
+  const rawVersion = normalizeNullableText(record.rawVersion);
+  const normalizedVersion = normalizeNullableText(record.normalizedVersion);
+  if (!source || !rawVersion || !normalizedVersion) return null;
+  return {
+    source,
+    rawVersion,
+    normalizedVersion,
+    url: normalizeNullableText(record.url),
+    tagName: normalizeNullableText(record.tagName),
+    digest: normalizeNullableText(record.digest),
+    displayVersion: normalizeNullableText(record.displayVersion),
+    publishedAt: normalizeNullableText(record.publishedAt),
+  };
+}
+
+function normalizeUpdateCenterVersionCandidateList(value: unknown): CloudflareUpdateCenterVersionCandidate[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => normalizeUpdateCenterVersionCandidate(item))
+    .filter((item): item is CloudflareUpdateCenterVersionCandidate => !!item);
+}
+
+function normalizeUpdateCenterHelperHistory(value: unknown): NonNullable<CloudflareUpdateCenterHelperStatus['history']> {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      const record = safeJsonObject(item);
+      const revision = normalizeNullableText(record.revision);
+      if (!revision) return null;
+      return {
+        revision,
+        updatedAt: normalizeNullableText(record.updatedAt),
+        status: normalizeNullableText(record.status),
+        description: normalizeNullableText(record.description),
+        imageRepository: normalizeNullableText(record.imageRepository),
+        imageTag: normalizeNullableText(record.imageTag),
+        imageDigest: normalizeNullableText(record.imageDigest),
+      };
+    })
+    .filter((item): item is NonNullable<CloudflareUpdateCenterHelperStatus['history']>[number] => !!item);
+}
+
+function normalizeUpdateCenterHelperStatus(value: unknown): CloudflareUpdateCenterHelperStatus | null {
+  const record = safeJsonObject(value);
+  if (Object.keys(record).length === 0) return null;
+  return {
+    ok: !!record.ok,
+    releaseName: normalizeNullableText(record.releaseName),
+    namespace: normalizeNullableText(record.namespace),
+    revision: normalizeNullableText(record.revision),
+    imageRepository: normalizeNullableText(record.imageRepository),
+    imageTag: normalizeNullableText(record.imageTag),
+    imageDigest: normalizeNullableText(record.imageDigest),
+    healthy: !!record.healthy,
+    error: normalizeNullableText(record.error) || undefined,
+    history: normalizeUpdateCenterHelperHistory(record.history),
+  };
+}
+
+function normalizeUpdateCenterStatusSnapshot(value: unknown): CloudflareUpdateCenterStatusSnapshot | null {
+  const record = safeJsonObject(value);
+  if (Object.keys(record).length === 0) return null;
+  return {
+    githubRelease: normalizeUpdateCenterVersionCandidate(record.githubRelease),
+    dockerHubTag: normalizeUpdateCenterVersionCandidate(record.dockerHubTag),
+    dockerHubRecentTags: normalizeUpdateCenterVersionCandidateList(record.dockerHubRecentTags),
+    helper: normalizeUpdateCenterHelperStatus(record.helper),
+  };
+}
+
+function normalizeCloudflareUpdateCenterRuntimeState(value: unknown): CloudflareUpdateCenterRuntimeState {
+  const defaults = getDefaultCloudflareUpdateCenterRuntimeState();
+  const record = safeJsonObject(value);
+  return {
+    lastCheckedAt: normalizeNullableText(record.lastCheckedAt),
+    lastCheckError: normalizeNullableText(record.lastCheckError),
+    lastResolvedSource: normalizeUpdateCenterVersionSource(record.lastResolvedSource),
+    lastResolvedDisplayVersion: normalizeNullableText(record.lastResolvedDisplayVersion),
+    lastResolvedCandidateKey: normalizeNullableText(record.lastResolvedCandidateKey),
+    lastNotifiedCandidateKey: normalizeNullableText(record.lastNotifiedCandidateKey),
+    lastNotifiedAt: normalizeNullableText(record.lastNotifiedAt),
+    statusSnapshot: Object.prototype.hasOwnProperty.call(record, 'statusSnapshot')
+      ? normalizeUpdateCenterStatusSnapshot(record.statusSnapshot)
+      : defaults.statusSnapshot,
+  };
+}
+
+function parseStableSemVer(text: string): { normalized: string; major: number; minor: number; patch: number } | null {
+  const raw = String(text || '').trim();
+  if (!raw) return null;
+  const matched = raw.match(UPDATE_CENTER_STABLE_SEMVER);
+  if (!matched) return null;
+  const major = Number.parseInt(matched[1] || '', 10);
+  const minor = Number.parseInt(matched[2] || '', 10);
+  const patch = Number.parseInt(matched[3] || '', 10);
+  if (![major, minor, patch].every(Number.isFinite)) return null;
+  return {
+    normalized: `${major}.${minor}.${patch}`,
+    major,
+    minor,
+    patch,
+  };
+}
+
+function compareStableSemVer(
+  left: { major: number; minor: number; patch: number },
+  right: { major: number; minor: number; patch: number },
+): number {
+  if (left.major !== right.major) return left.major - right.major;
+  if (left.minor !== right.minor) return left.minor - right.minor;
+  return left.patch - right.patch;
+}
+
+function normalizeUpdateCenterDigest(value: unknown): string | null {
+  const text = String(value || '').trim();
+  if (!text) return null;
+  return /^sha256:[a-f0-9]{64}$/i.test(text) ? text.toLowerCase() : null;
+}
+
+function toUpdateCenterShortDigest(value: string | null | undefined): string | null {
+  const digest = String(value || '').trim();
+  if (!digest) return null;
+  return digest.slice(0, 'sha256:'.length + 12);
+}
+
+function ensureUrlWithoutTrailingSlash(url: string): string {
+  return String(url || '').trim().replace(/\/+$/, '');
+}
+
+async function fetchJsonWithTimeout(url: string, init: RequestInit, label: string): Promise<unknown> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPDATE_CENTER_FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`${label} failed with HTTP ${response.status}`);
+    }
+    return await response.json();
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : `${label} failed`;
+    if (message.toLowerCase().includes('abort')) {
+      throw new Error(`${label} timeout (${Math.round(UPDATE_CENTER_FETCH_TIMEOUT_MS / 1000)}s)`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function normalizeDockerHubPublishedAt(record: Record<string, unknown>): string | null {
+  return normalizeNullableText(record.tag_last_pushed) || normalizeNullableText(record.last_updated);
+}
+
+function normalizeDockerHubPublishedTimestamp(record: Record<string, unknown>): number {
+  const publishedAt = normalizeDockerHubPublishedAt(record);
+  if (!publishedAt) return Number.NEGATIVE_INFINITY;
+  const timestamp = Date.parse(publishedAt);
+  return Number.isFinite(timestamp) ? timestamp : Number.NEGATIVE_INFINITY;
+}
+
+function normalizeDockerHubTagCandidate(
+  tagName: string,
+  source: CloudflareUpdateCenterVersionSource,
+  digest: string | null,
+  publishedAt: string | null,
+): CloudflareUpdateCenterVersionCandidate {
+  return {
+    source,
+    rawVersion: tagName,
+    normalizedVersion: tagName,
+    url: null,
+    tagName,
+    digest,
+    displayVersion: digest ? `${tagName} @ ${toUpdateCenterShortDigest(digest)}` : tagName,
+    publishedAt,
+  };
+}
+
+async function fetchLatestStableGithubRelease(): Promise<CloudflareUpdateCenterVersionCandidate | null> {
+  const payload = await fetchJsonWithTimeout(
+    UPDATE_CENTER_GITHUB_RELEASES_URL,
+    {
+      headers: {
+        accept: 'application/vnd.github+json',
+        'user-agent': 'metapi-update-center-worker/1.0',
+      },
+    },
+    'GitHub releases lookup',
+  );
+  const releases = Array.isArray(payload) ? payload : [];
+  let selected: { semver: { normalized: string; major: number; minor: number; patch: number }; release: Record<string, unknown> } | null = null;
+  for (const item of releases) {
+    const release = safeJsonObject(item);
+    if (release.draft === true || release.prerelease === true) continue;
+    const tag = String(release.tag_name || '').trim();
+    const semver = parseStableSemVer(tag);
+    if (!semver) continue;
+    if (!selected || compareStableSemVer(semver, selected.semver) > 0) {
+      selected = { semver, release };
+    }
+  }
+  if (!selected) return null;
+  const tagName = String(selected.release.tag_name || '').trim() || selected.semver.normalized;
+  return {
+    source: 'github-release',
+    rawVersion: tagName,
+    normalizedVersion: selected.semver.normalized,
+    url: normalizeNullableText(selected.release.html_url),
+    tagName,
+    digest: null,
+    displayVersion: selected.semver.normalized,
+    publishedAt: normalizeNullableText(selected.release.published_at),
+  };
+}
+
+async function fetchDockerHubTagCandidates(): Promise<{
+  primary: CloudflareUpdateCenterVersionCandidate | null;
+  recentNonStable: CloudflareUpdateCenterVersionCandidate[];
+}> {
+  const payload = await fetchJsonWithTimeout(
+    UPDATE_CENTER_DOCKER_HUB_TAGS_URL,
+    {
+      headers: {
+        accept: 'application/json',
+        'user-agent': 'metapi-update-center-worker/1.0',
+      },
+    },
+    'Docker Hub tag lookup',
+  );
+  const root = safeJsonObject(payload);
+  const results = Array.isArray(root.results) ? root.results : [];
+  const records = results
+    .map((item) => safeJsonObject(item))
+    .filter((item) => String(item.name || '').trim().length > 0);
+
+  const findAlias = (alias: string) => records.find((item) => String(item.name || '').trim() === alias);
+  const aliasRecord = findAlias('latest') || findAlias('main');
+
+  let primary: CloudflareUpdateCenterVersionCandidate | null = null;
+  if (aliasRecord) {
+    const tagName = String(aliasRecord.name || '').trim();
+    primary = normalizeDockerHubTagCandidate(
+      tagName,
+      'docker-hub-tag',
+      normalizeUpdateCenterDigest(aliasRecord.digest),
+      normalizeDockerHubPublishedAt(aliasRecord),
+    );
+  } else {
+    let selected: { semver: { normalized: string; major: number; minor: number; patch: number }; record: Record<string, unknown> } | null = null;
+    for (const record of records) {
+      const tagName = String(record.name || '').trim();
+      const semver = parseStableSemVer(tagName);
+      if (!semver) continue;
+      if (!selected || compareStableSemVer(semver, selected.semver) > 0) {
+        selected = { semver, record };
+      }
+    }
+    if (selected) {
+      const tagName = String(selected.record.name || '').trim();
+      primary = {
+        source: 'docker-hub-tag',
+        rawVersion: tagName,
+        normalizedVersion: selected.semver.normalized,
+        url: null,
+        tagName,
+        digest: normalizeUpdateCenterDigest(selected.record.digest),
+        displayVersion: normalizeUpdateCenterDigest(selected.record.digest)
+          ? `${tagName} @ ${toUpdateCenterShortDigest(normalizeUpdateCenterDigest(selected.record.digest))}`
+          : tagName,
+        publishedAt: normalizeDockerHubPublishedAt(selected.record),
+      };
+    }
+  }
+
+  const isStableTag = (tag: string): boolean => tag === 'latest' || tag === 'main' || !!parseStableSemVer(tag);
+  const dedupedRecent = new Map<string, Record<string, unknown>>();
+  for (const record of records) {
+    const tagName = String(record.name || '').trim();
+    if (!tagName || isStableTag(tagName)) continue;
+    const existing = dedupedRecent.get(tagName);
+    if (!existing || normalizeDockerHubPublishedTimestamp(record) > normalizeDockerHubPublishedTimestamp(existing)) {
+      dedupedRecent.set(tagName, record);
+    }
+  }
+  const recentNonStable = [...dedupedRecent.values()]
+    .sort((left, right) => normalizeDockerHubPublishedTimestamp(right) - normalizeDockerHubPublishedTimestamp(left))
+    .slice(0, 5)
+    .map((record) => {
+      const tagName = String(record.name || '').trim();
+      return normalizeDockerHubTagCandidate(
+        tagName,
+        'docker-hub-tag',
+        normalizeUpdateCenterDigest(record.digest),
+        normalizeDockerHubPublishedAt(record),
+      );
+    });
+
+  return { primary, recentNonStable };
+}
+
+async function loadCloudflareUpdateCenterConfig(db: ReturnType<typeof getCloudflareDb>): Promise<CloudflareUpdateCenterConfig> {
+  const stored = await readSetting(db, UPDATE_CENTER_CONFIG_SETTING_KEY);
+  return normalizeUpdateCenterConfig(stored);
+}
+
+async function saveCloudflareUpdateCenterConfig(
+  db: ReturnType<typeof getCloudflareDb>,
+  input: unknown,
+): Promise<CloudflareUpdateCenterConfig> {
+  const next = normalizeUpdateCenterConfig(input);
+  await writeSetting(db, UPDATE_CENTER_CONFIG_SETTING_KEY, next);
+  return next;
+}
+
+async function loadCloudflareUpdateCenterRuntimeState(db: ReturnType<typeof getCloudflareDb>): Promise<CloudflareUpdateCenterRuntimeState> {
+  const stored = await readSetting(db, UPDATE_CENTER_RUNTIME_STATE_SETTING_KEY);
+  return normalizeCloudflareUpdateCenterRuntimeState(stored);
+}
+
+async function saveCloudflareUpdateCenterRuntimeState(
+  db: ReturnType<typeof getCloudflareDb>,
+  input: unknown,
+): Promise<CloudflareUpdateCenterRuntimeState> {
+  const next = normalizeCloudflareUpdateCenterRuntimeState(input);
+  await writeSetting(db, UPDATE_CENTER_RUNTIME_STATE_SETTING_KEY, next);
+  return next;
+}
+
+function resolveUpdateCenterHelperTokenFromEnv(env: CloudflareHonoEnv['Bindings']): string {
+  return String(env.DEPLOY_HELPER_TOKEN || env.UPDATE_CENTER_HELPER_TOKEN || '').trim();
+}
+
+async function fetchUpdateCenterHelperStatus(
+  config: CloudflareUpdateCenterConfig,
+  helperToken: string,
+): Promise<CloudflareUpdateCenterHelperStatus> {
+  if (!config.helperBaseUrl) {
+    return {
+      ok: false,
+      releaseName: null,
+      namespace: null,
+      revision: null,
+      imageRepository: null,
+      imageTag: null,
+      imageDigest: null,
+      healthy: false,
+      history: [],
+      error: 'helperBaseUrl is required',
+    };
+  }
+  if (!helperToken) {
+    return {
+      ok: false,
+      releaseName: null,
+      namespace: null,
+      revision: null,
+      imageRepository: null,
+      imageTag: null,
+      imageDigest: null,
+      healthy: false,
+      history: [],
+      error: 'DEPLOY_HELPER_TOKEN is required',
+    };
+  }
+  try {
+    const query = new URLSearchParams({
+      namespace: config.namespace,
+      releaseName: config.releaseName,
+    });
+    const payload = await fetchJsonWithTimeout(
+      `${ensureUrlWithoutTrailingSlash(config.helperBaseUrl)}/status?${query.toString()}`,
+      {
+        headers: {
+          authorization: `Bearer ${helperToken}`,
+          accept: 'application/json',
+        },
+      },
+      'deploy helper status',
+    );
+    const normalized = normalizeUpdateCenterHelperStatus(payload);
+    if (!normalized) {
+      throw new Error('helper status payload is invalid');
+    }
+    return normalized;
+  } catch (error: unknown) {
+    return {
+      ok: false,
+      releaseName: null,
+      namespace: null,
+      revision: null,
+      imageRepository: null,
+      imageTag: null,
+      imageDigest: null,
+      healthy: false,
+      history: [],
+      error: error instanceof Error ? error.message : 'helper status failed',
+    };
+  }
+}
+
+function resolveUpdateCenterCandidateKey(candidate: CloudflareUpdateCenterVersionCandidate | null): string | null {
+  if (!candidate) return null;
+  const tag = String(candidate.tagName || candidate.rawVersion || candidate.normalizedVersion || '').trim();
+  const digest = String(candidate.digest || '').trim();
+  const source = candidate.source;
+  if (!tag) return null;
+  return `${source}:${tag}${digest ? `@${digest}` : ''}`;
+}
+
+function pickPreferredUpdateCenterCandidate(input: {
+  defaultSource: CloudflareUpdateCenterVersionSource;
+  githubRelease: CloudflareUpdateCenterVersionCandidate | null;
+  dockerHubTag: CloudflareUpdateCenterVersionCandidate | null;
+}): CloudflareUpdateCenterVersionCandidate | null {
+  if (input.defaultSource === 'github-release') {
+    return input.githubRelease || input.dockerHubTag;
+  }
+  return input.dockerHubTag || input.githubRelease;
+}
+
+function getUpdateCenterTaskState() {
+  const tasks = [...cloudflareTaskStore.values()]
+    .filter((task) => task.type === UPDATE_CENTER_DEPLOY_TASK_TYPE)
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  const runningTask = tasks.find((task) => task.status === 'running' || task.status === 'pending') || null;
+  const lastFinishedTask = tasks.find((task) => ['succeeded', 'failed', 'cancelled'].includes(task.status)) || null;
+  return { runningTask, lastFinishedTask };
+}
+
+type CloudflareUpdateCenterStatusPayload = {
+  currentVersion: string;
+  config: CloudflareUpdateCenterConfig;
+  githubRelease: CloudflareUpdateCenterVersionCandidate | null;
+  dockerHubTag: CloudflareUpdateCenterVersionCandidate | null;
+  dockerHubRecentTags: CloudflareUpdateCenterVersionCandidate[];
+  helper: CloudflareUpdateCenterHelperStatus | null;
+  runningTask: { id: string; status: string } | null;
+  lastFinishedTask: { id: string; status: string; finishedAt: string | null } | null;
+  runtime: {
+    lastCheckedAt: string | null;
+    lastCheckError: string | null;
+    lastResolvedSource: CloudflareUpdateCenterVersionSource | null;
+    lastResolvedDisplayVersion: string | null;
+    lastResolvedCandidateKey: string | null;
+    lastNotifiedCandidateKey: string | null;
+    lastNotifiedAt: string | null;
+  };
+};
+
+async function refreshCloudflareUpdateCenterStatusPayload(
+  db: ReturnType<typeof getCloudflareDb>,
+  env: CloudflareHonoEnv['Bindings'],
+): Promise<CloudflareUpdateCenterStatusPayload> {
+  const config = await loadCloudflareUpdateCenterConfig(db);
+  const runtime = await loadCloudflareUpdateCenterRuntimeState(db);
+  const helperToken = resolveUpdateCenterHelperTokenFromEnv(env);
+  let githubRelease: CloudflareUpdateCenterVersionCandidate | null = null;
+  let dockerHubTag: CloudflareUpdateCenterVersionCandidate | null = null;
+  let dockerHubRecentTags: CloudflareUpdateCenterVersionCandidate[] = [];
+  let helper: CloudflareUpdateCenterHelperStatus | null = null;
+  const checkErrors: string[] = [];
+
+  if (config.githubReleasesEnabled) {
+    try {
+      githubRelease = await fetchLatestStableGithubRelease();
+    } catch (error: unknown) {
+      checkErrors.push(error instanceof Error ? error.message : 'GitHub release lookup failed');
+    }
+  }
+  if (config.dockerHubTagsEnabled) {
+    try {
+      const dockerCandidates = await fetchDockerHubTagCandidates();
+      dockerHubTag = dockerCandidates.primary;
+      dockerHubRecentTags = dockerCandidates.recentNonStable;
+    } catch (error: unknown) {
+      checkErrors.push(error instanceof Error ? error.message : 'Docker Hub tag lookup failed');
+    }
+  }
+
+  helper = await fetchUpdateCenterHelperStatus(config, helperToken);
+  if (helper?.error) {
+    checkErrors.push(String(helper.error));
+  }
+
+  const preferred = pickPreferredUpdateCenterCandidate({
+    defaultSource: config.defaultDeploySource,
+    githubRelease,
+    dockerHubTag,
+  });
+  const candidateKey = resolveUpdateCenterCandidateKey(preferred);
+  const now = new Date().toISOString();
+  const nextRuntime: CloudflareUpdateCenterRuntimeState = {
+    ...runtime,
+    lastCheckedAt: now,
+    lastCheckError: checkErrors.length > 0 ? checkErrors[0] || null : null,
+    lastResolvedSource: preferred?.source || null,
+    lastResolvedDisplayVersion: preferred?.displayVersion || preferred?.normalizedVersion || null,
+    lastResolvedCandidateKey: candidateKey,
+    statusSnapshot: {
+      githubRelease,
+      dockerHubTag,
+      dockerHubRecentTags,
+      helper,
+    },
+  };
+  await saveCloudflareUpdateCenterRuntimeState(db, nextRuntime);
+  const { runningTask, lastFinishedTask } = getUpdateCenterTaskState();
+  const currentVersion = String(helper?.imageTag || '').trim() || 'cloudflare-worker';
+  return {
+    currentVersion,
+    config,
+    githubRelease,
+    dockerHubTag,
+    dockerHubRecentTags,
+    helper,
+    runningTask: runningTask ? { id: runningTask.id, status: runningTask.status } : null,
+    lastFinishedTask: lastFinishedTask
+      ? { id: lastFinishedTask.id, status: lastFinishedTask.status, finishedAt: lastFinishedTask.finishedAt }
+      : null,
+    runtime: {
+      lastCheckedAt: nextRuntime.lastCheckedAt,
+      lastCheckError: nextRuntime.lastCheckError,
+      lastResolvedSource: nextRuntime.lastResolvedSource,
+      lastResolvedDisplayVersion: nextRuntime.lastResolvedDisplayVersion,
+      lastResolvedCandidateKey: nextRuntime.lastResolvedCandidateKey,
+      lastNotifiedCandidateKey: nextRuntime.lastNotifiedCandidateKey,
+      lastNotifiedAt: nextRuntime.lastNotifiedAt,
+    },
+  };
+}
+
+async function readCloudflareUpdateCenterStatusPayload(
+  db: ReturnType<typeof getCloudflareDb>,
+): Promise<CloudflareUpdateCenterStatusPayload> {
+  const config = await loadCloudflareUpdateCenterConfig(db);
+  const runtime = await loadCloudflareUpdateCenterRuntimeState(db);
+  const snapshot = runtime.statusSnapshot || {
+    githubRelease: null,
+    dockerHubTag: null,
+    dockerHubRecentTags: [],
+    helper: null,
+  };
+  const { runningTask, lastFinishedTask } = getUpdateCenterTaskState();
+  const helper = snapshot.helper;
+  const currentVersion = String(helper?.imageTag || '').trim() || 'cloudflare-worker';
+  return {
+    currentVersion,
+    config,
+    githubRelease: snapshot.githubRelease || null,
+    dockerHubTag: snapshot.dockerHubTag || null,
+    dockerHubRecentTags: snapshot.dockerHubRecentTags || [],
+    helper: snapshot.helper || null,
+    runningTask: runningTask ? { id: runningTask.id, status: runningTask.status } : null,
+    lastFinishedTask: lastFinishedTask
+      ? { id: lastFinishedTask.id, status: lastFinishedTask.status, finishedAt: lastFinishedTask.finishedAt }
+      : null,
+    runtime: {
+      lastCheckedAt: runtime.lastCheckedAt,
+      lastCheckError: runtime.lastCheckError,
+      lastResolvedSource: runtime.lastResolvedSource,
+      lastResolvedDisplayVersion: runtime.lastResolvedDisplayVersion,
+      lastResolvedCandidateKey: runtime.lastResolvedCandidateKey,
+      lastNotifiedCandidateKey: runtime.lastNotifiedCandidateKey,
+      lastNotifiedAt: runtime.lastNotifiedAt,
+    },
+  };
+}
+
+function buildUpdateCenterDeployBlockMessage(input: {
+  config: CloudflareUpdateCenterConfig;
+  helper: CloudflareUpdateCenterHelperStatus | null;
+  targetTag: string;
+  targetDigest: string | null;
+}): string | null {
+  if (!input.config.enabled) return 'update center is disabled';
+  if (!input.config.helperBaseUrl) return 'helperBaseUrl is required';
+  if (!input.config.namespace) return 'namespace is required';
+  if (!input.config.releaseName) return 'releaseName is required';
+  if (!input.config.chartRef) return 'chartRef is required';
+  if (!input.config.imageRepository) return 'imageRepository is required';
+  if (!input.helper?.healthy) return input.helper?.error || 'deploy helper is not healthy';
+  const currentTag = String(input.helper.imageTag || '').trim();
+  const currentDigest = normalizeUpdateCenterDigest(input.helper.imageDigest);
+  if (currentTag && currentTag === input.targetTag) {
+    if (!input.targetDigest || !currentDigest || currentDigest === input.targetDigest) {
+      return 'target image is already running';
+    }
+  }
+  return null;
+}
+
+function parseSseEventBuffer(
+  buffer: string,
+  onChunk: (event: string, data: unknown) => void,
+): string {
+  const blocks = buffer.split('\n\n');
+  const remainder = blocks.pop() || '';
+  for (const block of blocks) {
+    const lines = block.split('\n');
+    let eventName = 'message';
+    const dataLines: string[] = [];
+    for (const line of lines) {
+      if (line.startsWith('event:')) {
+        eventName = line.slice('event:'.length).trim() || 'message';
+      } else if (line.startsWith('data:')) {
+        dataLines.push(line.slice('data:'.length).trim());
+      }
+    }
+    if (dataLines.length === 0) continue;
+    const rawData = dataLines.join('\n');
+    try {
+      onChunk(eventName, JSON.parse(rawData));
+    } catch {
+      onChunk(eventName, rawData);
+    }
+  }
+  return remainder;
+}
+
+async function streamHelperDeployAndUpdateTask(input: {
+  taskId: string;
+  config: CloudflareUpdateCenterConfig;
+  helperToken: string;
+  source: CloudflareUpdateCenterVersionSource;
+  targetTag: string;
+  targetDigest: string | null;
+}) {
+  const response = await fetch(`${ensureUrlWithoutTrailingSlash(input.config.helperBaseUrl)}/deploy`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${input.helperToken}`,
+      accept: 'text/event-stream',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      namespace: input.config.namespace,
+      releaseName: input.config.releaseName,
+      chartRef: input.config.chartRef,
+      imageRepository: input.config.imageRepository,
+      source: input.source,
+      targetTag: input.targetTag,
+      targetDigest: input.targetDigest,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`helper deploy failed with HTTP ${response.status}`);
+  }
+  if (!response.body) {
+    throw new Error('helper deploy response did not include a stream body');
+  }
+  let finalResult: unknown = null;
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    buffer = parseSseEventBuffer(buffer, (event, data) => {
+      if (event === 'log') {
+        const message = String((safeJsonObject(data).message ?? '') || '').trim();
+        if (message) appendCloudflareTaskLog(input.taskId, message);
+        return;
+      }
+      if (event === 'result') {
+        finalResult = data;
+      }
+    });
+  }
+  if (buffer.trim()) {
+    parseSseEventBuffer(`${buffer}\n\n`, (event, data) => {
+      if (event === 'log') {
+        const message = String((safeJsonObject(data).message ?? '') || '').trim();
+        if (message) appendCloudflareTaskLog(input.taskId, message);
+        return;
+      }
+      if (event === 'result') {
+        finalResult = data;
+      }
+    });
+  }
+  if (!finalResult) {
+    throw new Error('helper deploy stream ended without a result event');
+  }
+  const resultRecord = safeJsonObject(finalResult);
+  if (resultRecord.success !== true) {
+    throw new Error('deploy helper reported a failed deployment');
+  }
+  updateCloudflareTask(input.taskId, {
+    status: 'succeeded',
+    message: '更新中心部署已完成',
+    result: resultRecord,
+    error: null,
+  });
+}
+
+async function streamHelperRollbackAndUpdateTask(input: {
+  taskId: string;
+  config: CloudflareUpdateCenterConfig;
+  helperToken: string;
+  targetRevision: string;
+}) {
+  const response = await fetch(`${ensureUrlWithoutTrailingSlash(input.config.helperBaseUrl)}/rollback`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${input.helperToken}`,
+      accept: 'text/event-stream',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      namespace: input.config.namespace,
+      releaseName: input.config.releaseName,
+      targetRevision: input.targetRevision,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`helper rollback failed with HTTP ${response.status}`);
+  }
+  if (!response.body) {
+    throw new Error('helper rollback response did not include a stream body');
+  }
+  let finalResult: unknown = null;
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    buffer = parseSseEventBuffer(buffer, (event, data) => {
+      if (event === 'log') {
+        const message = String((safeJsonObject(data).message ?? '') || '').trim();
+        if (message) appendCloudflareTaskLog(input.taskId, message);
+        return;
+      }
+      if (event === 'result') {
+        finalResult = data;
+      }
+    });
+  }
+  if (buffer.trim()) {
+    parseSseEventBuffer(`${buffer}\n\n`, (event, data) => {
+      if (event === 'log') {
+        const message = String((safeJsonObject(data).message ?? '') || '').trim();
+        if (message) appendCloudflareTaskLog(input.taskId, message);
+        return;
+      }
+      if (event === 'result') {
+        finalResult = data;
+      }
+    });
+  }
+  if (!finalResult) {
+    throw new Error('helper rollback stream ended without a result event');
+  }
+  const resultRecord = safeJsonObject(finalResult);
+  if (resultRecord.success !== true) {
+    throw new Error('deploy helper reported a failed rollback');
+  }
+  updateCloudflareTask(input.taskId, {
+    status: 'succeeded',
+    message: '更新中心回退已完成',
+    result: resultRecord,
+    error: null,
+  });
+}
 
 function escapeHtml(value: string): string {
   return value
@@ -6594,116 +7520,222 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
     });
   });
 
-  app.get('/api/update-center/status', async (_c) => {
-    return _c.json({
-      currentVersion: 'cloudflare-worker',
-      config: {
-        enabled: false,
-        helperBaseUrl: '',
-        namespace: 'default',
-        releaseName: '',
-        chartRef: '',
-        imageRepository: 'metapi',
-        githubReleasesEnabled: false,
-        dockerHubTagsEnabled: false,
-        defaultDeploySource: 'github-release',
-      },
-      githubRelease: null,
-      dockerHubTag: null,
-      dockerHubRecentTags: [],
-      helper: {
-        ok: false,
-        healthy: false,
-        error: 'Cloudflare Worker 版本不支持 Update Center',
-      },
-      runningTask: null,
-      lastFinishedTask: null,
-      runtime: {
-        lastCheckedAt: new Date().toISOString(),
-        lastCheckError: 'Cloudflare Worker 版本不支持 Update Center',
-        lastResolvedSource: null,
-        lastResolvedDisplayVersion: null,
-        lastResolvedCandidateKey: null,
-        lastNotifiedCandidateKey: null,
-        lastNotifiedAt: null,
-      },
-    });
+  app.get('/api/update-center/status', async (c) => {
+    const db = getCloudflareDb(c);
+    const status = await readCloudflareUpdateCenterStatusPayload(db);
+    return c.json(status);
   });
 
   app.put('/api/update-center/config', async (c) => {
+    const db = getCloudflareDb(c);
     const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+    const parsed = parseUpdateCenterConfigPayload(body);
+    if (!parsed.success) {
+      return c.json({ success: false, message: parsed.error }, 400);
+    }
+    const saved = await saveCloudflareUpdateCenterConfig(db, parsed.data);
     return c.json({
       success: true,
-      config: {
-        enabled: !!body.enabled,
-        helperBaseUrl: String(body.helperBaseUrl || ''),
-        namespace: String(body.namespace || 'default'),
-        releaseName: String(body.releaseName || ''),
-        chartRef: String(body.chartRef || ''),
-        imageRepository: String(body.imageRepository || 'metapi'),
-        githubReleasesEnabled: !!body.githubReleasesEnabled,
-        dockerHubTagsEnabled: !!body.dockerHubTagsEnabled,
-        defaultDeploySource: String(body.defaultDeploySource || 'github-release') === 'docker-hub-tag'
-          ? 'docker-hub-tag'
-          : 'github-release',
-      },
+      config: saved,
     });
   });
 
-  app.post('/api/update-center/check', async (_c) => {
-    return _c.json({
-      currentVersion: 'cloudflare-worker',
-      config: {
-        enabled: false,
-        helperBaseUrl: '',
-        namespace: 'default',
-        releaseName: '',
-        chartRef: '',
-        imageRepository: 'metapi',
-        githubReleasesEnabled: false,
-        dockerHubTagsEnabled: false,
-        defaultDeploySource: 'github-release',
-      },
-      githubRelease: null,
-      dockerHubTag: null,
-      dockerHubRecentTags: [],
-      helper: {
-        ok: false,
-        healthy: false,
-        error: 'Cloudflare Worker 版本不支持 Update Center',
-      },
-      runningTask: null,
-      lastFinishedTask: null,
+  app.post('/api/update-center/check', async (c) => {
+    const db = getCloudflareDb(c);
+    const status = await refreshCloudflareUpdateCenterStatusPayload(db, c.env);
+    return c.json(status);
+  });
+
+  app.post('/api/update-center/deploy', async (c) => {
+    const db = getCloudflareDb(c);
+    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+    const parsed = parseUpdateCenterDeployPayload(body);
+    if (!parsed.success) {
+      return c.json({ success: false, message: parsed.error }, 400);
+    }
+
+    const config = await loadCloudflareUpdateCenterConfig(db);
+    const helperToken = resolveUpdateCenterHelperTokenFromEnv(c.env);
+    const source: CloudflareUpdateCenterVersionSource = parsed.data.source === 'docker-hub-tag'
+      ? 'docker-hub-tag'
+      : parsed.data.source === 'github-release'
+        ? 'github-release'
+        : config.defaultDeploySource;
+    const targetTag = String(parsed.data.targetTag || parsed.data.targetVersion || '').trim();
+    const targetDigest = normalizeUpdateCenterDigest(parsed.data.targetDigest);
+    if (!targetTag) {
+      return c.json({ success: false, message: 'targetTag is required' }, 400);
+    }
+
+    const helper = await fetchUpdateCenterHelperStatus(config, helperToken);
+    const blockMessage = buildUpdateCenterDeployBlockMessage({
+      config,
+      helper,
+      targetTag,
+      targetDigest,
     });
+    if (blockMessage) {
+      return c.json({ success: false, message: blockMessage }, 409);
+    }
+
+    const running = [...cloudflareTaskStore.values()]
+      .find((task) => task.type === UPDATE_CENTER_DEPLOY_TASK_TYPE && (task.status === 'running' || task.status === 'pending'));
+    if (running) {
+      return c.json({ success: true, reused: true, task: running }, 202);
+    }
+
+    const task = createCloudflareTask({
+      type: UPDATE_CENTER_DEPLOY_TASK_TYPE,
+      title: '更新中心部署',
+      status: 'running',
+      message: '正在部署',
+    });
+    appendCloudflareTaskLog(task.id, `Resolving target image: ${targetTag}${targetDigest ? ` @ ${targetDigest}` : ''}`);
+    appendCloudflareTaskLog(task.id, `Contacting deploy helper: ${config.helperBaseUrl}`);
+
+    const run = (async () => {
+      try {
+        await streamHelperDeployAndUpdateTask({
+          taskId: task.id,
+          config,
+          helperToken,
+          source,
+          targetTag,
+          targetDigest,
+        });
+        appendCloudflareTaskLog(task.id, 'Deployment finished successfully');
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'deploy helper failed';
+        appendCloudflareTaskLog(task.id, message);
+        updateCloudflareTask(task.id, {
+          status: 'failed',
+          message: '更新中心部署失败',
+          error: { message },
+        });
+      } finally {
+        await refreshCloudflareUpdateCenterStatusPayload(db, c.env).catch(() => null);
+      }
+    })();
+    c.executionCtx.waitUntil(run);
+    return c.json({ success: true, reused: false, task }, 202);
   });
 
-  app.post('/api/update-center/deploy', async (_c) => {
-    return _c.json({ success: false, message: 'Cloudflare Worker 版本不支持 Update Center 部署' }, 400);
-  });
+  app.post('/api/update-center/rollback', async (c) => {
+    const db = getCloudflareDb(c);
+    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+    const parsed = parseUpdateCenterRollbackPayload(body);
+    if (!parsed.success) {
+      return c.json({ success: false, message: parsed.error }, 400);
+    }
+    const targetRevision = String(parsed.data.targetRevision || '').trim();
+    if (!targetRevision) {
+      return c.json({ success: false, message: 'targetRevision is required' }, 400);
+    }
 
-  app.post('/api/update-center/rollback', async (_c) => {
-    return _c.json({ success: false, message: 'Cloudflare Worker 版本不支持 Update Center 回滚' }, 400);
+    const config = await loadCloudflareUpdateCenterConfig(db);
+    const helperToken = resolveUpdateCenterHelperTokenFromEnv(c.env);
+    if (!config.enabled) return c.json({ success: false, message: 'update center is disabled' }, 400);
+    if (!config.helperBaseUrl) return c.json({ success: false, message: 'helperBaseUrl is required' }, 400);
+    if (!config.namespace) return c.json({ success: false, message: 'namespace is required' }, 400);
+    if (!config.releaseName) return c.json({ success: false, message: 'releaseName is required' }, 400);
+    if (!helperToken) return c.json({ success: false, message: 'DEPLOY_HELPER_TOKEN is required' }, 400);
+
+    const running = [...cloudflareTaskStore.values()]
+      .find((task) => task.type === UPDATE_CENTER_DEPLOY_TASK_TYPE && (task.status === 'running' || task.status === 'pending'));
+    if (running) {
+      return c.json({ success: true, reused: true, task: running }, 202);
+    }
+
+    const task = createCloudflareTask({
+      type: UPDATE_CENTER_DEPLOY_TASK_TYPE,
+      title: '更新中心回退',
+      status: 'running',
+      message: '正在回退',
+    });
+    appendCloudflareTaskLog(task.id, `Resolving rollback revision: ${targetRevision}`);
+    appendCloudflareTaskLog(task.id, `Contacting deploy helper: ${config.helperBaseUrl}`);
+
+    const run = (async () => {
+      try {
+        await streamHelperRollbackAndUpdateTask({
+          taskId: task.id,
+          config,
+          helperToken,
+          targetRevision,
+        });
+        appendCloudflareTaskLog(task.id, 'Rollback finished successfully');
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'rollback helper failed';
+        appendCloudflareTaskLog(task.id, message);
+        updateCloudflareTask(task.id, {
+          status: 'failed',
+          message: '更新中心回退失败',
+          error: { message },
+        });
+      } finally {
+        await refreshCloudflareUpdateCenterStatusPayload(db, c.env).catch(() => null);
+      }
+    })();
+    c.executionCtx.waitUntil(run);
+    return c.json({ success: true, reused: false, task }, 202);
   });
 
   app.get('/api/update-center/tasks/:id/stream', async (c) => {
-    c.header('Content-Type', 'text/event-stream; charset=utf-8');
-    c.header('Cache-Control', 'no-cache');
     const taskId = String(c.req.param('id') || '').trim();
-    const task = cloudflareTaskStore.get(taskId);
-    const payload = task || {
-      id: taskId,
-      status: 'failed',
-      error: 'task not found',
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+    const encoder = new TextEncoder();
+    const writeEvent = async (event: string, payload: unknown) => {
+      await writer.write(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`));
     };
-    const body = [
-      `event: log`,
-      `data: ${JSON.stringify({ message: 'Cloudflare Worker 版本不支持 Update Center 任务流式日志' })}`,
-      '',
-      `event: done`,
-      `data: ${JSON.stringify(payload)}`,
-      '',
-    ].join('\n');
-    return new Response(body, {
+
+    const streamTask = async () => {
+      let sentLogCount = 0;
+      let tick = 0;
+      try {
+        while (tick < 600) {
+          tick += 1;
+          const task = cloudflareTaskStore.get(taskId);
+          if (!task) {
+            await writeEvent('log', { message: 'task not found' });
+            await writeEvent('done', { id: taskId, status: 'failed', error: 'task not found' });
+            return;
+          }
+          const logs = Array.isArray(task.logs) ? task.logs : [];
+          while (sentLogCount < logs.length) {
+            const log = logs[sentLogCount] || { message: '' };
+            sentLogCount += 1;
+            const message = String(log.message || '').trim();
+            if (!message) continue;
+            await writeEvent('log', { message, createdAt: log.createdAt || null });
+          }
+          if (['succeeded', 'failed', 'cancelled'].includes(task.status)) {
+            await writeEvent('done', {
+              id: task.id,
+              status: task.status,
+              result: task.result,
+              error: task.error,
+              finishedAt: task.finishedAt,
+            });
+            return;
+          }
+          await scheduler.wait(600);
+        }
+        const snapshot = cloudflareTaskStore.get(taskId);
+        await writeEvent('done', {
+          id: taskId,
+          status: snapshot?.status || 'running',
+          result: snapshot?.result,
+          error: snapshot?.error,
+          finishedAt: snapshot?.finishedAt || null,
+        });
+      } finally {
+        await writer.close();
+      }
+    };
+
+    c.executionCtx.waitUntil(streamTask());
+    return new Response(readable, {
       status: 200,
       headers: {
         'Content-Type': 'text/event-stream; charset=utf-8',
