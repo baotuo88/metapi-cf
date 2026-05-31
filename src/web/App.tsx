@@ -512,9 +512,16 @@ function AppShell() {
       try {
         const response = await fetch('/api/cloudflare/health');
         if (!response.ok) return;
-        const payload = await response.json() as { runtime?: string };
-        if (!cancelled && payload.runtime === 'cloudflare-worker') {
-          setIsCloudflareRuntime(true);
+        const payload = await response.json() as {
+          runtime?: string;
+          apiProxyMode?: string;
+        };
+        if (cancelled) return;
+        const isWorkerOnlyMode = payload.runtime === 'cloudflare-worker'
+          && payload.apiProxyMode === 'worker-only';
+        setIsCloudflareRuntime(isWorkerOnlyMode);
+        if (payload.runtime === 'cloudflare-worker' && payload.apiProxyMode === 'hybrid-node-proxy') {
+          setIsCloudflareRuntime(false);
         }
       } catch {
         // ignore runtime detection errors
