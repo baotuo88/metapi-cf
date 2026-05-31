@@ -579,10 +579,35 @@ function buildProbeHeaders(
 function parseUserSelfPayload(raw: unknown): Record<string, unknown> | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const root = raw as Record<string, unknown>;
+  if (root.success === false) return null;
   if (root.data && typeof root.data === 'object' && !Array.isArray(root.data)) {
     return root.data as Record<string, unknown>;
   }
   return root;
+}
+
+function buildSessionCookieCandidates(token: string): string[] {
+  const trimmed = token.trim();
+  if (!trimmed) return [];
+  const raw = trimmed.startsWith('Bearer ') ? trimmed.slice(7).trim() : trimmed;
+  if (!raw) return [];
+  const candidates: string[] = [];
+  if (raw.includes('=')) candidates.push(raw);
+  candidates.push(`session=${raw}`);
+  candidates.push(`token=${raw}`);
+  return Array.from(new Set(candidates));
+}
+
+function toBalanceDataFromPayload(raw: unknown): Record<string, unknown> | null {
+  const parsed = parseUserSelfPayload(raw);
+  if (parsed) return parsed;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const root = raw as Record<string, unknown>;
+  const maybeData = root.data;
+  if (maybeData && typeof maybeData === 'object' && !Array.isArray(maybeData)) {
+    return maybeData as Record<string, unknown>;
+  }
+  return null;
 }
 
 function roundCurrency(value: number): number {
@@ -613,19 +638,53 @@ async function refreshAccountBalanceFromUpstream(
   const endpoint = normalizeEndpointBaseUrl(site.url);
   if (!endpoint) return null;
 
-  const headers = buildProbeHeaders(site, token, resolveProbePlatformUserId(account));
-  const response = await fetch(`${endpoint}/api/user/self`, {
-    method: 'GET',
-    headers,
-  }).catch(() => null);
-  if (!response || !response.ok) return null;
+  const runUserSelfRequest = async (headers: Record<string, string>): Promise<Record<string, unknown> | null> => {
+    const response = await fetch(`${endpoint}/api/user/self`, {
+      method: 'GET',
+      headers,
+    }).catch(() => null);
+    if (!response || !response.ok) return null;
+    const payload = await response.json().catch(() => null);
+    return toBalanceDataFromPayload(payload);
+  };
 
-  const payload = await response.json().catch(() => null);
-  const data = parseUserSelfPayload(payload);
+  const platformUserId = resolveProbePlatformUserId(account);
+  const headerAttempts: Array<Record<string, string>> = [];
+  headerAttempts.push(buildProbeHeaders(site, token, platformUserId));
+  if (platformUserId) {
+    headerAttempts.push(buildProbeHeaders(site, token, null));
+  }
+
+  let data: Record<string, unknown> | null = null;
+  for (const headers of headerAttempts) {
+    data = await runUserSelfRequest(headers);
+    if (data) break;
+  }
+
+  if (!data) {
+    const cookieCandidates = buildSessionCookieCandidates(token);
+    const fallbackHeaders: Array<Record<string, string>> = [];
+    for (const cookie of cookieCandidates) {
+      fallbackHeaders.push({
+        Accept: 'application/json',
+        Cookie: cookie,
+        ...(platformUserId ? { 'New-Api-User': platformUserId, 'User-ID': platformUserId } : {}),
+      });
+      fallbackHeaders.push({
+        Accept: 'application/json',
+        Cookie: cookie,
+      });
+    }
+    for (const headers of fallbackHeaders) {
+      data = await runUserSelfRequest(headers);
+      if (data) break;
+    }
+  }
+
   if (!data) return null;
 
-  const rawQuota = Number(data.quota);
-  const rawUsed = Number(data.used_quota ?? data.usedQuota);
+  const rawQuota = Number(data.quota ?? data.remain_quota ?? data.remaining_quota ?? data.total_available);
+  const rawUsed = Number(data.used_quota ?? data.usedQuota ?? data.total_used ?? 0);
   if (!Number.isFinite(rawQuota) || !Number.isFinite(rawUsed)) return null;
 
   const scale = mapQuotaUnitScale(String(site.platform || ''));
