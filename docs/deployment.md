@@ -72,7 +72,7 @@ npm run cf:release:provision
 - `build:cloudflare`
 - `wrangler secret put AUTH_TOKEN`
 - `wrangler secret put PROXY_TOKEN`
-- 远程 D1 初始化（`d1.bootstrap.sql`）
+- 远程 D1 初始化（`d1.bootstrap.sql`，与 Worker 启动时自动 bootstrap 二选一冗余保障）
 - `wrangler deploy`
 
 ### 4) 分步执行（可选）
@@ -81,9 +81,12 @@ npm run cf:release:provision
 npm run cf:provision
 npm run cf:preflight
 npm run build:cloudflare
-npm run cf:d1:init:remote
+# 可选：若希望显式初始化 D1，可执行下面这一行
+# npm run cf:d1:init:remote
 npm run cf:deploy
 ```
+
+> 说明：当前 Worker 已内置 D1 schema 自动 bootstrap。首次请求会自动补齐表和索引，通常不需要再手工粘贴 SQL。
 
 ### 5) 健康检查
 

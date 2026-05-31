@@ -299,8 +299,10 @@
 4. 在 `Settings -> Bindings` 添加：
    - D1: `METAPI_DB`
    - R2: `METAPI_FILES`
-5. 在 D1 控制台执行 [`src/server/db/generated/d1.bootstrap.sql`](./src/server/db/generated/d1.bootstrap.sql) 初始化表结构。
-6. 重新 Deploy 后访问 `GET /api/cloudflare/health`，确认 `bindings.d1/r2` 均为 `true`。
+5. 重新 Deploy 后首次请求会自动执行 D1 schema bootstrap（已内置在 Worker 启动逻辑中，无需手工粘贴 SQL）。
+6. 访问 `GET /api/cloudflare/health`，确认 `bindings.d1/r2` 均为 `true`。
+
+如需手工初始化（可选），可在 D1 控制台执行 [`src/server/db/generated/d1.bootstrap.sql`](./src/server/db/generated/d1.bootstrap.sql)。
 
 如果你用本地命令自动化初始化+发布，可执行：
 
