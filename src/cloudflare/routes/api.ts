@@ -1071,6 +1071,172 @@ async function performUpstreamLogin(input: {
   }
 }
 
+type CloudflareCheckinResult = {
+  status: 'success' | 'failed' | 'skipped';
+  message: string;
+  reward: string;
+  runtimeState: CloudflareRuntimeHealthState;
+  runtimeReason: string;
+};
+
+function isAlreadyCheckedInMessage(message?: string | null): boolean {
+  if (!message) return false;
+  const text = String(message).trim();
+  if (!text) return false;
+  const normalized = text.toLowerCase();
+  return normalized.includes('already checked in')
+    || normalized.includes('already signed')
+    || normalized.includes('already sign in')
+    || text.includes('今日已签到')
+    || text.includes('今天已签到')
+    || text.includes('今天已经签到')
+    || text.includes('今日已经签到')
+    || text.includes('已经签到')
+    || text.includes('已签到')
+    || text.includes('重复签到')
+    || text.includes('签到过');
+}
+
+function isUnsupportedCheckinMessage(message?: string | null): boolean {
+  if (!message) return false;
+  const text = String(message).toLowerCase();
+  return text.includes('invalid url (post /api/user/checkin)')
+    || (text.includes('http 404') && text.includes('/api/user/checkin'))
+    || text.includes('checkin endpoint not found')
+    || text.includes('check-in is not supported')
+    || text.includes('checkin is not supported')
+    || text.includes('does not support checkin')
+    || text.includes('not support checkin');
+}
+
+function isManualVerificationRequiredMessage(message?: string | null): boolean {
+  if (!message) return false;
+  const text = String(message).toLowerCase();
+  return text.includes('turnstile token 为空')
+    || (text.includes('turnstile') && (text.includes('token') || text.includes('校验') || text.includes('验证')));
+}
+
+function parseCheckinReward(payload: unknown, fallbackMessage: string): string {
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    const root = payload as Record<string, unknown>;
+    const data = root.data && typeof root.data === 'object' && !Array.isArray(root.data)
+      ? root.data as Record<string, unknown>
+      : null;
+    const rewardCandidates = [
+      root.reward,
+      data?.reward,
+      data?.amount,
+      data?.quota,
+      data?.grant,
+    ];
+    for (const candidate of rewardCandidates) {
+      const text = String(candidate ?? '').trim();
+      if (!text) continue;
+      if (text === '0' || text === '0.0' || text === '0.00') continue;
+      return text;
+    }
+  }
+  const parsed = parseRewardNumber(fallbackMessage);
+  return parsed > 0 ? String(parsed) : '';
+}
+
+async function performUpstreamCheckin(input: {
+  site: typeof schema.sites.$inferSelect;
+  account: typeof schema.accounts.$inferSelect;
+}): Promise<CloudflareCheckinResult> {
+  const endpoint = normalizeEndpointBaseUrl(input.site.url);
+  if (!endpoint) {
+    return {
+      status: 'failed',
+      message: '站点地址无效',
+      reward: '',
+      runtimeState: 'unhealthy',
+      runtimeReason: '站点地址无效',
+    };
+  }
+  const token = String(input.account.accessToken || '').trim();
+  if (!token) {
+    return {
+      status: 'failed',
+      message: '缺少有效 Session Token',
+      reward: '',
+      runtimeState: 'unhealthy',
+      runtimeReason: '缺少有效 Session Token',
+    };
+  }
+  const platformUserId = parseNumericUserId(resolveProbePlatformUserId(input.account));
+  const headerAttempts = buildSessionVerifyHeaderAttempts(input.site, token, platformUserId);
+  const timeoutMessage = `checkin timed out (${Math.max(1, Math.round(ACCOUNT_VERIFY_TIMEOUT_MS / 1000))}s)`;
+  let lastError = '签到失败';
+
+  for (const headers of headerAttempts) {
+    const response = await withTimeout(
+      () => fetch(`${endpoint}/api/user/checkin`, {
+        method: 'POST',
+        headers: {
+          ...headers,
+          'Content-Type': headers['Content-Type'] || headers['content-type'] || 'application/json',
+        },
+        body: '{}',
+      }).catch(() => null),
+      ACCOUNT_VERIFY_TIMEOUT_MS,
+      timeoutMessage,
+    ).catch(() => null);
+
+    if (!response) continue;
+
+    const contentType = String(response.headers.get('content-type') || '');
+    const bodyText = await response.text();
+    const payload = parseJsonSafe(bodyText);
+    if (isShieldChallengeResponse(contentType, bodyText)) {
+      lastError = 'This site is shielded by anti-bot challenge. Checkin request blocked.';
+      continue;
+    }
+
+    const upstreamMessage = extractMessageFromPayload(payload) || bodyText.trim() || `HTTP ${response.status}`;
+    const alreadyCheckedIn = isAlreadyCheckedInMessage(upstreamMessage);
+    const unsupportedCheckin = isUnsupportedCheckinMessage(upstreamMessage);
+    const manualVerificationRequired = isManualVerificationRequiredMessage(upstreamMessage);
+    const successByPayload = !!(payload && typeof payload === 'object' && !Array.isArray(payload) && (payload as Record<string, unknown>).success === true);
+    const reward = parseCheckinReward(payload, upstreamMessage);
+
+    if (successByPayload || alreadyCheckedIn) {
+      return {
+        status: 'success',
+        message: alreadyCheckedIn ? '今天已经签到' : (upstreamMessage || '签到成功'),
+        reward,
+        runtimeState: 'healthy',
+        runtimeReason: alreadyCheckedIn ? '今日已签到' : '签到成功',
+      };
+    }
+
+    if (unsupportedCheckin || manualVerificationRequired) {
+      return {
+        status: 'skipped',
+        message: manualVerificationRequired ? '站点开启了 Turnstile 校验，需要人工签到' : upstreamMessage,
+        reward: '',
+        runtimeState: 'degraded',
+        runtimeReason: manualVerificationRequired ? '站点开启了 Turnstile 校验，需要人工签到' : '站点不支持签到接口',
+      };
+    }
+
+    if (!response.ok) {
+      lastError = upstreamMessage || `HTTP ${response.status}`;
+      continue;
+    }
+
+    lastError = upstreamMessage || lastError;
+  }
+
+  return {
+    status: 'failed',
+    message: lastError || '签到失败',
+    reward: '',
+    runtimeState: 'unhealthy',
+    runtimeReason: lastError || '签到失败',
+  };
+}
+
 type ProbeFetchResult =
   | { success: true; models: string[]; latencyMs: number; endpointUrl: string }
   | {
@@ -5007,9 +5173,13 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
       }
 
       try {
+        const checkinResult = await performUpstreamCheckin({
+          site: row.site,
+          account: row.account,
+        });
         const runtimeHealth = buildRuntimeHealthRecord({
-          state: 'healthy',
-          reason: '签到触发成功',
+          state: checkinResult.runtimeState,
+          reason: checkinResult.runtimeReason,
           source: 'checkin',
           checkedAt: new Date().toISOString(),
         });
@@ -5018,17 +5188,23 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
         });
         await db.insert(schema.checkinLogs).values({
           accountId: row.account.id,
-          status: 'success',
-          message: 'Cloudflare Worker 已记录签到完成',
-          reward: '',
+          status: checkinResult.status,
+          message: checkinResult.message,
+          reward: checkinResult.reward,
           createdAt: now,
         }).run();
         await db.update(schema.accounts).set({
-          lastCheckinAt: now,
+          ...(checkinResult.status === 'success' ? { lastCheckinAt: now } : {}),
           extraConfig: nextExtraConfig,
           updatedAt: now,
         }).where(eq(schema.accounts.id, row.account.id)).run();
-        success += 1;
+        if (checkinResult.status === 'success') {
+          success += 1;
+        } else if (checkinResult.status === 'skipped') {
+          skipped += 1;
+        } else {
+          failed += 1;
+        }
       } catch {
         failed += 1;
       }
@@ -5038,7 +5214,7 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
       type: 'checkin',
       title: '全部账号签到',
       status: failed > 0 ? 'failed' : 'succeeded',
-      message: `Cloudflare 版本已完成签到：成功 ${success}，跳过 ${skipped}，失败 ${failed}`,
+      message: `签到完成：成功 ${success}，跳过 ${skipped}，失败 ${failed}`,
       result: { success, failed, skipped },
     });
     return c.json({
@@ -5087,9 +5263,13 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
       });
     }
 
+    const checkinResult = await performUpstreamCheckin({
+      site: site!,
+      account,
+    });
     const runtimeHealth = buildRuntimeHealthRecord({
-      state: 'healthy',
-      reason: '签到触发成功',
+      state: checkinResult.runtimeState,
+      reason: checkinResult.runtimeReason,
       source: 'checkin',
       checkedAt: new Date().toISOString(),
     });
@@ -5098,20 +5278,28 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
     });
     await db.insert(schema.checkinLogs).values({
       accountId,
-      status: 'success',
-      message: 'Cloudflare Worker 已记录签到完成',
-      reward: '',
+      status: checkinResult.status,
+      message: checkinResult.message,
+      reward: checkinResult.reward,
       createdAt: now,
     }).run();
     await db.update(schema.accounts).set({
-      lastCheckinAt: now,
+      ...(checkinResult.status === 'success' ? { lastCheckinAt: now } : {}),
       extraConfig: nextExtraConfig,
       updatedAt: now,
     }).where(eq(schema.accounts.id, accountId)).run();
+    if (checkinResult.status === 'failed') {
+      return c.json({
+        success: false,
+        status: 'failed',
+        message: checkinResult.message,
+      }, 400);
+    }
     return c.json({
       success: true,
-      status: 'success',
-      message: '签到完成',
+      status: checkinResult.status,
+      ...(checkinResult.status === 'skipped' ? { skipped: true } : {}),
+      message: checkinResult.message || '签到完成',
     });
   });
 
