@@ -454,6 +454,17 @@ function resolveCloudflareAccountDisplayName(account: typeof schema.accounts.$in
   return null;
 }
 
+function shouldAutoUpgradeAccountUsername(username: unknown): boolean {
+  const normalized = String(username || '').trim();
+  if (!normalized) return true;
+  if (/^unknown-user$/i.test(normalized)) return true;
+  if (/^user-\d+$/i.test(normalized)) return true;
+  if (/^session[-_]/i.test(normalized)) return true;
+  if (/^token[-_]/i.test(normalized)) return true;
+  if (/^linuxdo_\d{3,8}$/i.test(normalized)) return true;
+  return false;
+}
+
 type CloudflareLoginFailureInfo = {
   message: string;
   shieldBlocked: boolean;
@@ -709,14 +720,13 @@ function parseSessionVerifyDataToUserInfo(data: Record<string, unknown>): {
 } {
   const userIdValue = data.id ?? data.userId ?? data.user_id;
   const userId = parseNumericUserId(userIdValue);
+  const displayName = String(data.display_name ?? data.displayName ?? '').trim();
   const username = String(
-    data.username
-    ?? data.display_name
-    ?? data.displayName
+    displayName
+    || data.username
     ?? data.email
     ?? (userId ? `user-${userId}` : ''),
   ).trim() || (userId ? `user-${userId}` : 'unknown-user');
-  const displayName = String(data.display_name ?? data.displayName ?? '').trim();
   const email = String(data.email ?? '').trim();
   const role = Number.isFinite(Number(data.role)) ? Number(data.role) : undefined;
   return {
@@ -1534,7 +1544,7 @@ async function refreshAccountBalanceFromUpstream(
   const rawQuota = Number(data.quota ?? data.remain_quota ?? data.remaining_quota ?? data.total_available);
   const rawUsed = Number(data.used_quota ?? data.usedQuota ?? data.total_used ?? 0);
   if (!Number.isFinite(rawQuota) || !Number.isFinite(rawUsed)) return null;
-  const username = String(data.username ?? data.display_name ?? data.displayName ?? '').trim() || null;
+  const username = String(data.display_name ?? data.displayName ?? data.username ?? '').trim() || null;
 
   const scale = mapQuotaUnitScale(String(site.platform || ''));
   const quotaUnit = rawQuota / scale;
@@ -5208,7 +5218,7 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
               balance: refreshedBalance.balance,
               balanceUsed: refreshedBalance.used,
               quota: refreshedBalance.quota,
-              ...(String(row.account.username || '').trim() ? {} : { username: refreshedBalance.username || null }),
+              ...(shouldAutoUpgradeAccountUsername(row.account.username) ? { username: refreshedBalance.username || null } : {}),
             }
             : {}),
           extraConfig: nextExtraConfig,
@@ -5314,7 +5324,7 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
           balance: refreshedBalance.balance,
           balanceUsed: refreshedBalance.used,
           quota: refreshedBalance.quota,
-          ...(String(account.username || '').trim() ? {} : { username: refreshedBalance.username || null }),
+          ...(shouldAutoUpgradeAccountUsername(account.username) ? { username: refreshedBalance.username || null } : {}),
         }
         : {}),
       extraConfig: nextExtraConfig,
@@ -7542,17 +7552,17 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
           const nextExtraConfig = mergeAccountExtraConfig(existing.extraConfig, {
             runtimeHealth,
           });
-          await db.update(schema.accounts).set({
-            ...(balance
-              ? {
+            await db.update(schema.accounts).set({
+              ...(balance
+                ? {
                 balance: balance.balance,
                 balanceUsed: balance.used,
                 quota: balance.quota,
-                ...(String(existing.username || '').trim() ? {} : { username: balance.username || null }),
+                ...(shouldAutoUpgradeAccountUsername(existing.username) ? { username: balance.username || null } : {}),
               }
               : {}),
-            lastBalanceRefresh: formatUtcSqlDateTime(),
-            extraConfig: nextExtraConfig,
+              lastBalanceRefresh: formatUtcSqlDateTime(),
+              extraConfig: nextExtraConfig,
             updatedAt: formatUtcSqlDateTime(),
           }).where(eq(schema.accounts.id, id)).run();
         }
@@ -7592,7 +7602,7 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
           balance: refreshed.balance,
           balanceUsed: refreshed.used,
           quota: refreshed.quota,
-          ...(String(account.username || '').trim() ? {} : { username: refreshed.username || null }),
+          ...(shouldAutoUpgradeAccountUsername(account.username) ? { username: refreshed.username || null } : {}),
         }
         : {}),
       lastBalanceRefresh: formatUtcSqlDateTime(),
