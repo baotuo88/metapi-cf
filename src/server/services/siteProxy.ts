@@ -143,7 +143,12 @@ async function getCachedSiteProxyRows(nowMs = Date.now()): Promise<SiteProxyRow[
 
     siteProxyCache = {
       loadedAt: nowMs,
-      rows: rows.map((row) => ({
+      rows: rows.map((row: {
+        siteUrl: string;
+        proxyUrl: string | null;
+        useSystemProxy: boolean | null;
+        customHeaders: unknown;
+      }) => ({
         siteUrl: normalizeSiteUrl(row.siteUrl),
         proxyUrl: normalizeSiteProxyUrl(row.proxyUrl),
         useSystemProxy: !!row.useSystemProxy,
