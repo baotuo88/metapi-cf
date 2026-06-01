@@ -1240,6 +1240,28 @@ function isManualVerificationRequiredMessage(message?: string | null): boolean {
     || (text.includes('turnstile') && (text.includes('token') || text.includes('校验') || text.includes('验证')));
 }
 
+function isRateLimitedCheckinMessage(message?: string | null): boolean {
+  if (!message) return false;
+  const text = String(message).toLowerCase();
+  return text.includes('too many requests')
+    || text.includes('rate limit')
+    || text.includes('请求过于频繁')
+    || text.includes('频率过高')
+    || text.includes('访问过快')
+    || text.includes('操作频繁');
+}
+
+function parseRetryAfterSeconds(retryAfterHeader?: string | null): number | null {
+  const raw = String(retryAfterHeader || '').trim();
+  if (!raw) return null;
+  const seconds = Number.parseInt(raw, 10);
+  if (Number.isFinite(seconds) && seconds > 0) return seconds;
+  const retryAt = Date.parse(raw);
+  if (!Number.isFinite(retryAt)) return null;
+  const deltaSeconds = Math.ceil((retryAt - Date.now()) / 1000);
+  return deltaSeconds > 0 ? deltaSeconds : null;
+}
+
 function parseCheckinReward(payload: unknown, fallbackMessage: string): string {
   if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
     const root = payload as Record<string, unknown>;
@@ -1321,6 +1343,7 @@ async function performUpstreamCheckin(input: {
     const alreadyCheckedIn = isAlreadyCheckedInMessage(upstreamMessage);
     const unsupportedCheckin = isUnsupportedCheckinMessage(upstreamMessage);
     const manualVerificationRequired = isManualVerificationRequiredMessage(upstreamMessage);
+    const rateLimited = response.status === 429 || isRateLimitedCheckinMessage(upstreamMessage);
     const successByPayload = !!(payload && typeof payload === 'object' && !Array.isArray(payload) && (payload as Record<string, unknown>).success === true);
     const reward = parseCheckinReward(payload, upstreamMessage);
 
@@ -1341,6 +1364,19 @@ async function performUpstreamCheckin(input: {
         reward: '',
         runtimeState: 'degraded',
         runtimeReason: manualVerificationRequired ? '站点开启了 Turnstile 校验，需要人工签到' : '站点不支持签到接口',
+      };
+    }
+
+    if (rateLimited) {
+      const retryAfterSeconds = parseRetryAfterSeconds(response.headers.get('retry-after'));
+      return {
+        status: 'skipped',
+        message: retryAfterSeconds
+          ? `签到请求过于频繁，建议 ${retryAfterSeconds} 秒后重试`
+          : '签到请求过于频繁，请稍后重试',
+        reward: '',
+        runtimeState: 'degraded',
+        runtimeReason: '签到请求触发限流',
       };
     }
 
