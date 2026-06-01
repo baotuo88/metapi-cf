@@ -1316,20 +1316,36 @@ async function performUpstreamCheckin(input: {
   let lastError = '签到失败';
 
   for (const headers of headerAttempts) {
-    const response = await withTimeout(
-      () => fetch(`${endpoint}/api/user/checkin`, {
-        method: 'POST',
-        headers: {
-          ...headers,
-          'Content-Type': headers['Content-Type'] || headers['content-type'] || 'application/json',
-        },
-        body: '{}',
-      }).catch(() => null),
+    const responseResult = await withTimeout(
+      async () => {
+        try {
+          const response = await fetch(`${endpoint}/api/user/checkin`, {
+            method: 'POST',
+            headers: {
+              ...headers,
+              'Content-Type': headers['Content-Type'] || headers['content-type'] || 'application/json',
+            },
+            body: '{}',
+          });
+          return { response } as const;
+        } catch (error: unknown) {
+          return { error } as const;
+        }
+      },
       ACCOUNT_VERIFY_TIMEOUT_MS,
       timeoutMessage,
-    ).catch(() => null);
+    ).catch((error: unknown) => ({ error } as const));
 
-    if (!response) continue;
+    if ('error' in responseResult) {
+      const errorMessage = responseResult.error instanceof Error
+        ? String(responseResult.error.message || '').trim()
+        : '';
+      if (errorMessage) {
+        lastError = errorMessage;
+      }
+      continue;
+    }
+    const response = responseResult.response;
 
     const contentType = String(response.headers.get('content-type') || '');
     const bodyText = await response.text();
@@ -9402,8 +9418,18 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
         } else {
           failed += 1;
         }
-      } catch {
+      } catch (error: unknown) {
         failed += 1;
+        const failedMessage = error instanceof Error
+          ? String(error.message || '').trim() || '签到失败'
+          : '签到失败';
+        await db.insert(schema.checkinLogs).values({
+          accountId: row.account.id,
+          status: 'failed',
+          message: failedMessage,
+          reward: '',
+          createdAt: now,
+        }).run().catch(() => undefined);
       }
     }
 

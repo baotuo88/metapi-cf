@@ -4,7 +4,7 @@ import * as schema from '../../server/db/schema.js';
 import { registerCoreApiRoutes } from './api.js';
 import type { CloudflareHonoEnv } from '../shared/http.js';
 
-function createCheckinTestDb() {
+function createCheckinTestDb(options?: { throwOnAccountUpdate?: boolean }) {
   const siteRow = {
     id: 1,
     name: 'Site A',
@@ -56,15 +56,18 @@ function createCheckinTestDb() {
 
   const makeSelectBuilder = () => {
     let table: unknown = null;
+    let joined = false;
     const builder: any = {
       from(nextTable: unknown) {
         table = nextTable;
         return builder;
       },
       innerJoin() {
+        joined = true;
         return builder;
       },
       leftJoin() {
+        joined = true;
         return builder;
       },
       where() {
@@ -83,6 +86,9 @@ function createCheckinTestDb() {
         return builder;
       },
       async all() {
+        if (table === schema.accounts && joined) {
+          return [{ account: accountRow, site: siteRow }];
+        }
         if (table === schema.accounts) return [accountRow];
         if (table === schema.sites) return [siteRow];
         return [];
@@ -113,11 +119,17 @@ function createCheckinTestDb() {
             where() {
               return {
                 async run() {
+                  if (target === schema.accounts && options?.throwOnAccountUpdate) {
+                    throw new Error('account update failed');
+                  }
                   return { changes: 1 };
                 },
               };
             },
             async run() {
+              if (target === schema.accounts && options?.throwOnAccountUpdate) {
+                throw new Error('account update failed');
+              }
               return { changes: 1 };
             },
           };
@@ -190,9 +202,9 @@ function createCheckinTestDb() {
   };
 }
 
-function createTestApp() {
+function createTestApp(options?: { throwOnAccountUpdate?: boolean }) {
   const app = new Hono<CloudflareHonoEnv>();
-  const fakeDb = createCheckinTestDb();
+  const fakeDb = createCheckinTestDb(options);
   app.use('*', async (c, next) => {
     c.set('db', fakeDb as never);
     await next();
@@ -288,5 +300,81 @@ describe('cloudflare checkin rate limit handling', () => {
     expect(response.status).toBe(200);
     expect(payload.status).toBe('skipped');
     expect(String(payload.message || '')).toContain('120 秒后重试');
+  });
+
+  it('preserves upstream network error detail for single-account checkin failure', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/api/user/checkin')) {
+        throw new Error('connect timeout');
+      }
+      return new Response(JSON.stringify({ success: true, data: { quota: 10, used_quota: 0 } }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+        },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const { app, fakeDb } = createTestApp();
+    const response = await postJson(app, '/api/checkin/trigger/1', {});
+    const payload = await response.json() as Record<string, unknown>;
+
+    expect(response.status).toBe(400);
+    expect(payload.success).toBe(false);
+    expect(payload.status).toBe('failed');
+    expect(String(payload.message || '')).toContain('connect timeout');
+    expect(fakeDb.checkinLogs).toHaveLength(1);
+    expect(String(fakeDb.checkinLogs[0]?.status || '')).toBe('failed');
+    expect(String(fakeDb.checkinLogs[0]?.message || '')).toContain('connect timeout');
+  });
+
+  it('writes failed checkin log when bulk checkin throws during per-account update', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/api/user/checkin')) {
+        return new Response(JSON.stringify({ success: true, message: 'ok', data: { reward: '1' } }), {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+          },
+        });
+      }
+      if (url.endsWith('/api/user/self')) {
+        return new Response(JSON.stringify({
+          success: true,
+          data: {
+            quota: 10,
+            used_quota: 0,
+            username: 'demo',
+          },
+        }), {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+          },
+        });
+      }
+      return new Response('{}', {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+        },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const { app, fakeDb } = createTestApp({ throwOnAccountUpdate: true });
+    const response = await postJson(app, '/api/checkin/trigger', {});
+    const payload = await response.json() as Record<string, unknown>;
+    const summary = payload.summary as Record<string, unknown>;
+
+    expect(response.status).toBe(200);
+    expect(payload.success).toBe(true);
+    expect(summary.failed).toBe(1);
+    expect(summary.success).toBe(0);
+    expect(fakeDb.checkinLogs.length).toBeGreaterThan(0);
+    const failedLog = fakeDb.checkinLogs.find((item) => String(item.status || '') === 'failed');
+    expect(!!failedLog).toBe(true);
+    expect(String(failedLog?.message || '')).toContain('account update failed');
   });
 });
