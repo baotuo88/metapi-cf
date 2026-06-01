@@ -11,6 +11,7 @@ const { apiMock } = vi.hoisted(() => ({
     getAccountsSnapshot: vi.fn(),
     getSites: vi.fn(),
     refreshBalance: vi.fn(),
+    triggerCheckin: vi.fn(),
   },
 }));
 
@@ -109,6 +110,71 @@ describe('Accounts refresh action', () => {
       expect(apiMock.getAccounts).toHaveBeenCalledTimes(2);
       const rendered = JSON.stringify(root.toJSON());
       expect(rendered).toContain('已过期');
+    } finally {
+      root?.unmount();
+    }
+  });
+
+  it('updates balance immediately after checkin even when follow-up reload fails', async () => {
+    apiMock.getAccounts
+      .mockResolvedValueOnce([
+        {
+          id: 1,
+          username: 'tester',
+          balance: 100,
+          balanceUsed: 0,
+          todayReward: 0,
+          todaySpend: 0,
+          accessToken: 'session-token',
+          status: 'active',
+          checkinEnabled: true,
+          site: { id: 10, name: 'Demo Site', status: 'active', url: 'https://example.com' },
+          runtimeHealth: { state: 'healthy', reason: 'ok' },
+        },
+      ])
+      .mockRejectedValueOnce(new Error('snapshot reload failed'));
+    apiMock.getSites.mockResolvedValue([{ id: 10, name: 'Demo Site', platform: 'new-api', status: 'active' }]);
+    apiMock.triggerCheckin.mockResolvedValueOnce({
+      success: true,
+      status: 'success',
+      message: '签到完成',
+      balance: 188.88,
+      balanceUsed: 11,
+      quota: 200,
+    });
+
+    let root!: WebTestRenderer;
+    try {
+      await act(async () => {
+        root = create(
+          <MemoryRouter initialEntries={['/accounts']}>
+            <ToastProvider>
+              <Accounts />
+            </ToastProvider>
+          </MemoryRouter>,
+        );
+      });
+      await flushMicrotasks();
+
+      const checkinButtons = root.root.findAll((node) => (
+        node.type === 'button'
+        && typeof node.props.onClick === 'function'
+        && typeof node.props.className === 'string'
+        && node.props.className.includes('btn-link-warning')
+        && collectText(node).trim() === '签到'
+      ));
+      expect(checkinButtons.length).toBeGreaterThan(0);
+      const checkinButton = checkinButtons[0]!;
+
+      await act(async () => {
+        await checkinButton.props.onClick();
+      });
+      await flushMicrotasks();
+
+      expect(apiMock.triggerCheckin).toHaveBeenCalledWith(1);
+      const rendered = JSON.stringify(root.toJSON());
+      expect(rendered).toContain('"188.88"');
+      expect(rendered).toContain('"11.00"');
     } finally {
       root?.unmount();
     }

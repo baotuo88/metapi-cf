@@ -571,6 +571,57 @@ export default function Accounts() {
     }
   };
 
+  const applyAccountRuntimePatch = (
+    accountId: number,
+    payload: Record<string, any> | null | undefined,
+  ) => {
+    if (!payload || typeof payload !== "object") return;
+    setAccounts((current) =>
+      current.map((account) => {
+        if (account.id !== accountId) return account;
+        const serverAccount =
+          payload.account && typeof payload.account === "object"
+            ? payload.account
+            : null;
+        if (serverAccount) {
+          return {
+            ...account,
+            ...serverAccount,
+            site: account.site,
+          };
+        }
+        const next = { ...account } as Record<string, any>;
+        if (Number.isFinite(Number(payload.balance))) {
+          next.balance = Number(payload.balance);
+        }
+        if (Number.isFinite(Number(payload.balanceUsed))) {
+          next.balanceUsed = Number(payload.balanceUsed);
+        }
+        if (Number.isFinite(Number(payload.quota))) {
+          next.quota = Number(payload.quota);
+        }
+        return next;
+      }),
+    );
+  };
+
+  const handleSingleCheckin = async (account: any) => {
+    const key = `checkin-${account.id}`;
+    setActionLoading((s) => ({ ...s, [key]: true }));
+    try {
+      const result = (await api.triggerCheckin(account.id)) as Record<string, any>;
+      applyAccountRuntimePatch(account.id, result);
+      toast.success(
+        String(result?.message || "").trim() || "签到完成",
+      );
+    } catch (e: any) {
+      toast.error(e.message || "签到失败");
+    } finally {
+      setActionLoading((s) => ({ ...s, [key]: false }));
+      void load(true);
+    }
+  };
+
   const formatModelSuccess = (refresh: any) => {
     const models = Array.isArray(refresh?.modelsPreview)
       ? refresh.modelsPreview
@@ -3042,13 +3093,7 @@ export default function Accounts() {
                               )}
                               {capabilities.canCheckin && (
                                 <button
-                                  onClick={() =>
-                                    withLoading(
-                                      `checkin-${a.id}`,
-                                      () => api.triggerCheckin(a.id),
-                                      "签到完成",
-                                    )
-                                  }
+                                  onClick={() => handleSingleCheckin(a)}
                                   disabled={actionLoading[`checkin-${a.id}`]}
                                   className="btn btn-link btn-link-warning"
                                 >
@@ -3373,13 +3418,7 @@ export default function Accounts() {
                               </button>
                               {capabilities.canCheckin && (
                                 <button
-                                  onClick={() =>
-                                    withLoading(
-                                      `checkin-${a.id}`,
-                                      () => api.triggerCheckin(a.id),
-                                      "签到完成",
-                                    )
-                                  }
+                                  onClick={() => handleSingleCheckin(a)}
                                   disabled={actionLoading[`checkin-${a.id}`]}
                                   className="btn btn-link btn-link-warning"
                                 >
