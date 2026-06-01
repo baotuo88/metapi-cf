@@ -377,4 +377,39 @@ describe('cloudflare checkin rate limit handling', () => {
     expect(!!failedLog).toBe(true);
     expect(String(failedLog?.message || '')).toContain('account update failed');
   });
+
+  it('maps upstream unauthorized no-access-token message to actionable auth failure hint', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/api/user/checkin')) {
+        return new Response(JSON.stringify({
+          success: false,
+          message: 'Unauthorized, not logged in and no access token provided',
+        }), {
+          status: 401,
+          headers: {
+            'content-type': 'application/json',
+          },
+        });
+      }
+      return new Response('{}', {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+        },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const { app, fakeDb } = createTestApp();
+    const response = await postJson(app, '/api/checkin/trigger/1', {});
+    const payload = await response.json() as Record<string, unknown>;
+
+    expect(response.status).toBe(400);
+    expect(payload.success).toBe(false);
+    expect(payload.status).toBe('failed');
+    expect(String(payload.message || '')).toContain('会话已失效或未登录');
+    expect(fakeDb.checkinLogs).toHaveLength(1);
+    expect(String(fakeDb.checkinLogs[0]?.status || '')).toBe('failed');
+    expect(String(fakeDb.checkinLogs[0]?.message || '')).toContain('会话已失效或未登录');
+  });
 });

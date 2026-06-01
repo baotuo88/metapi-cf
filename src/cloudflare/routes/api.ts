@@ -1251,6 +1251,19 @@ function isRateLimitedCheckinMessage(message?: string | null): boolean {
     || text.includes('操作频繁');
 }
 
+function isSessionAuthMissingCheckinMessage(message?: string | null): boolean {
+  if (!message) return false;
+  const text = String(message).toLowerCase();
+  return text.includes('unauthorized, not logged in and no access token provided')
+    || text.includes('not logged in and no access token provided')
+    || text.includes('no access token provided')
+    || text.includes('not logged in')
+    || text.includes('access token missing')
+    || text.includes('未登录')
+    || text.includes('未提供 access token')
+    || text.includes('未提供access token');
+}
+
 function parseRetryAfterSeconds(retryAfterHeader?: string | null): number | null {
   const raw = String(retryAfterHeader || '').trim();
   if (!raw) return null;
@@ -1359,6 +1372,7 @@ async function performUpstreamCheckin(input: {
     const alreadyCheckedIn = isAlreadyCheckedInMessage(upstreamMessage);
     const unsupportedCheckin = isUnsupportedCheckinMessage(upstreamMessage);
     const manualVerificationRequired = isManualVerificationRequiredMessage(upstreamMessage);
+    const missingSessionAuth = isSessionAuthMissingCheckinMessage(upstreamMessage);
     const rateLimited = response.status === 429 || isRateLimitedCheckinMessage(upstreamMessage);
     const successByPayload = !!(payload && typeof payload === 'object' && !Array.isArray(payload) && (payload as Record<string, unknown>).success === true);
     const reward = parseCheckinReward(payload, upstreamMessage);
@@ -1380,6 +1394,16 @@ async function performUpstreamCheckin(input: {
         reward: '',
         runtimeState: 'degraded',
         runtimeReason: manualVerificationRequired ? '站点开启了 Turnstile 校验，需要人工签到' : '站点不支持签到接口',
+      };
+    }
+
+    if (missingSessionAuth) {
+      return {
+        status: 'failed',
+        message: '会话已失效或未登录，请重新登录并更新 Session Token',
+        reward: '',
+        runtimeState: 'unhealthy',
+        runtimeReason: `签到鉴权失败：${upstreamMessage || '未登录且未提供 access token'}`,
       };
     }
 
