@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { and, desc, eq, gte, inArray, lt, sql } from 'drizzle-orm';
 import * as schema from '../../server/db/schema.js';
 import {
@@ -7210,6 +7210,36 @@ type CloudflareModelRefreshResult = {
   latencyMs: number | null;
 };
 
+type CloudflareModelAvailabilityProbeAccountResult = {
+  accountId: number;
+  siteId: number;
+  status: 'success' | 'failed' | 'skipped';
+  scanned: number;
+  supported: number;
+  unsupported: number;
+  inconclusive: number;
+  skipped: number;
+  updatedRows: number;
+  message: string;
+};
+
+type CloudflareModelAvailabilityProbeExecutionResult = {
+  results: CloudflareModelAvailabilityProbeAccountResult[];
+  summary: {
+    totalAccounts: number;
+    success: number;
+    failed: number;
+    skipped: number;
+    scanned: number;
+    supported: number;
+    unsupported: number;
+    inconclusive: number;
+    skippedModels: number;
+    updatedRows: number;
+    rebuiltRoutes: boolean;
+  };
+};
+
 async function refreshCloudflareModelsForAllActiveAccounts(
   db: ReturnType<typeof getCloudflareDb>,
 ): Promise<CloudflareModelRefreshResult[]> {
@@ -7240,6 +7270,77 @@ async function refreshCloudflareModelsForAllActiveAccounts(
     });
   }
   return results;
+}
+
+function buildCloudflareModelAvailabilityProbeTaskDedupeKey(accountId?: number | null): string {
+  const normalizedAccountId = Number.isFinite(accountId as number) && Number(accountId) > 0
+    ? Math.trunc(Number(accountId))
+    : null;
+  return normalizedAccountId
+    ? `model-availability-probe-${normalizedAccountId}`
+    : 'model-availability-probe-all';
+}
+
+function summarizeCloudflareModelAvailabilityProbeResults(
+  results: CloudflareModelAvailabilityProbeAccountResult[],
+): CloudflareModelAvailabilityProbeExecutionResult {
+  return {
+    results,
+    summary: {
+      totalAccounts: results.length,
+      success: results.filter((item) => item.status === 'success').length,
+      failed: results.filter((item) => item.status === 'failed').length,
+      skipped: results.filter((item) => item.status === 'skipped').length,
+      scanned: results.reduce((sum, item) => sum + item.scanned, 0),
+      supported: results.reduce((sum, item) => sum + item.supported, 0),
+      unsupported: results.reduce((sum, item) => sum + item.unsupported, 0),
+      inconclusive: results.reduce((sum, item) => sum + item.inconclusive, 0),
+      skippedModels: results.reduce((sum, item) => sum + item.skipped, 0),
+      updatedRows: results.reduce((sum, item) => sum + item.updatedRows, 0),
+      rebuiltRoutes: false,
+    },
+  };
+}
+
+async function executeCloudflareModelAvailabilityProbe(
+  db: ReturnType<typeof getCloudflareDb>,
+  input: { accountId?: number } = {},
+): Promise<CloudflareModelAvailabilityProbeExecutionResult> {
+  const rows = await db.select({
+    account: schema.accounts,
+    site: schema.sites,
+  }).from(schema.accounts)
+    .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+    .where(input.accountId
+      ? eq(schema.accounts.id, input.accountId)
+      : and(
+        eq(schema.accounts.status, 'active'),
+        eq(schema.sites.status, 'active'),
+      ))
+    .all();
+
+  const results: CloudflareModelAvailabilityProbeAccountResult[] = [];
+  for (const row of rows) {
+    const refresh = await runAccountModelProbe(db, row.account, row.site);
+    const succeeded = refresh.status === 'success';
+    const scanned = succeeded ? refresh.modelCount : 0;
+    results.push({
+      accountId: row.account.id,
+      siteId: row.site.id,
+      status: succeeded ? 'success' : 'failed',
+      scanned,
+      supported: succeeded ? refresh.modelCount : 0,
+      unsupported: 0,
+      inconclusive: succeeded ? 0 : 1,
+      skipped: 0,
+      updatedRows: succeeded ? refresh.modelCount : 0,
+      message: succeeded
+        ? `模型探测完成：发现 ${refresh.modelCount} 个模型`
+        : (refresh.errorMessage || '模型可用性探测失败'),
+    });
+  }
+
+  return summarizeCloudflareModelAvailabilityProbeResults(results);
 }
 
 async function refreshCloudflareModelsAndRebuildRoutes(
@@ -11049,7 +11150,7 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
     });
   });
 
-  app.put('/api/oauth/route-units/:routeUnitId', async (c) => {
+  const handleOauthRouteUnitUpdate = async (c: Context<CloudflareHonoEnv>) => {
     const db = getCloudflareDb(c);
     const routeUnitId = Math.trunc(Number(c.req.param('routeUnitId')));
     if (!Number.isFinite(routeUnitId) || routeUnitId <= 0) return c.json({ message: 'invalid route unit id' }, 400);
@@ -11085,7 +11186,10 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
         memberCount: Math.max(0, Math.trunc(toFiniteNumber(memberCountRow?.count))),
       },
     });
-  });
+  };
+
+  app.put('/api/oauth/route-units/:routeUnitId', handleOauthRouteUnitUpdate);
+  app.patch('/api/oauth/route-units/:routeUnitId', handleOauthRouteUnitUpdate);
 
   app.delete('/api/oauth/route-units/:routeUnitId', async (c) => {
     const db = getCloudflareDb(c);
@@ -11161,6 +11265,101 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
         ? `已获取到模型（共 ${refresh.modelCount} 个）`
         : (refresh.errorMessage || '模型获取失败'),
     });
+  });
+
+  app.post('/api/models/probe', async (c) => {
+    const rawBody = await c.req.json().catch(() => undefined) as unknown;
+    if (rawBody !== undefined && !isRecordObject(rawBody)) {
+      return c.json({ success: false, message: '请求体必须是对象' }, 400);
+    }
+
+    const body = (rawBody || {}) as Record<string, unknown>;
+    const normalizedAccountId = body.accountId === undefined || body.accountId === null
+      ? ''
+      : String(body.accountId).trim();
+    const hasAccountId = normalizedAccountId !== '';
+    const parsedAccountId = hasAccountId && /^[1-9]\d*$/.test(normalizedAccountId)
+      ? Number(normalizedAccountId)
+      : undefined;
+    const accountId = parsedAccountId !== undefined && Number.isSafeInteger(parsedAccountId)
+      ? parsedAccountId
+      : undefined;
+    if (hasAccountId && accountId === undefined) {
+      return c.json({ success: false, message: '账号 ID 无效' }, 400);
+    }
+
+    const db = getCloudflareDb(c);
+    const wait = body.wait === true;
+    const title = accountId ? `探测模型可用性 #${accountId}` : '探测全部模型可用性';
+    const dedupeKey = buildCloudflareModelAvailabilityProbeTaskDedupeKey(accountId);
+
+    if (wait) {
+      const result = await executeCloudflareModelAvailabilityProbe(db, { accountId });
+      if (accountId && result.summary.totalAccounts === 0) {
+        return c.json({ success: false, message: '账号不存在' }, 404);
+      }
+      return c.json({
+        success: true,
+        queued: false,
+        status: 'succeeded',
+        ...result,
+      });
+    }
+
+    const runningTask = [...cloudflareTaskStore.values()].find((task) => (
+      task.type === 'model-probe'
+      && String(task.dedupeKey || '') === dedupeKey
+      && (task.status === 'pending' || task.status === 'running')
+    ));
+    if (runningTask) {
+      return c.json({
+        success: true,
+        queued: true,
+        reused: true,
+        jobId: runningTask.id,
+        taskId: runningTask.id,
+        status: runningTask.status,
+        message: '模型可用性探测任务进行中，请稍后查看任务列表',
+      }, 202);
+    }
+
+    const task = createCloudflareTask({
+      type: 'model-probe',
+      dedupeKey,
+      title,
+      status: 'running',
+      message: '正在探测模型可用性',
+    });
+
+    const run = (async () => {
+      try {
+        const result = await executeCloudflareModelAvailabilityProbe(db, { accountId });
+        updateCloudflareTask(task.id, {
+          status: 'succeeded',
+          message: `${title}完成：探测 ${result.summary.scanned}，可用 ${result.summary.supported}，失败账号 ${result.summary.failed}`,
+          result,
+          error: null,
+        });
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : '模型可用性探测失败';
+        updateCloudflareTask(task.id, {
+          status: 'failed',
+          message: `${title}失败：${message}`,
+          error: message,
+        });
+      }
+    })();
+    c.executionCtx.waitUntil(run);
+
+    return c.json({
+      success: true,
+      queued: true,
+      reused: false,
+      jobId: task.id,
+      taskId: task.id,
+      status: task.status,
+      message: '已开始模型可用性探测，请稍后查看任务列表',
+    }, 202);
   });
 
   app.get('/api/update-center/status', async (c) => {
@@ -12559,6 +12758,36 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
       updatedAt: formatUtcSqlDateTime(),
     }).where(eq(schema.accountTokens.id, id)).run();
     return c.json({ success: true });
+  });
+
+  app.get('/api/account-tokens/account/:accountId/default', async (c) => {
+    const db = getCloudflareDb(c);
+    const accountId = Math.trunc(Number(c.req.param('accountId')));
+    if (!Number.isFinite(accountId) || accountId <= 0) return c.json({ success: false, message: '账号 ID 无效' }, 400);
+
+    const row = await db
+      .select()
+      .from(schema.accountTokens)
+      .innerJoin(schema.accounts, eq(schema.accountTokens.accountId, schema.accounts.id))
+      .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+      .where(and(
+        eq(schema.accountTokens.accountId, accountId),
+        eq(schema.accountTokens.isDefault, true),
+      ))
+      .get();
+
+    if (!row || resolveStoredCredentialMode(row.accounts) === 'apikey') {
+      return c.json({ success: true, token: null });
+    }
+
+    const { token: rawToken, ...meta } = row.account_tokens;
+    return c.json({
+      success: true,
+      token: {
+        ...meta,
+        tokenMasked: maskSecret(rawToken || ''),
+      },
+    });
   });
 
   app.get('/api/account-tokens/:id/value', async (c) => {

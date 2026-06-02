@@ -576,10 +576,11 @@ export async function forwardCloudflareProxyRequest(input: {
   };
   db: CloudflareD1Db;
   auth: CloudflareProxyAuthContext;
+  pathOverride?: string;
 }): Promise<Response> {
   const request = input.c.req.raw;
   const requestUrl = new URL(request.url);
-  const pathname = requestUrl.pathname;
+  const pathname = normalizeString(input.pathOverride) || requestUrl.pathname;
 
   if (request.method.toUpperCase() === 'GET' && pathname === '/v1/models') {
     const payload = await listCloudflareProxyModels({
@@ -589,6 +590,18 @@ export async function forwardCloudflareProxyRequest(input: {
     });
     return new Response(JSON.stringify(payload), {
       status: 200,
+      headers: { 'content-type': 'application/json; charset=utf-8' },
+    });
+  }
+
+  if (request.method.toUpperCase() === 'GET' && (pathname === '/v1/responses' || pathname === '/v1/responses/compact')) {
+    return new Response(JSON.stringify({
+      error: {
+        message: `WebSocket upgrade required for GET ${pathname}`,
+        type: 'invalid_request_error',
+      },
+    }), {
+      status: 426,
       headers: { 'content-type': 'application/json; charset=utf-8' },
     });
   }
