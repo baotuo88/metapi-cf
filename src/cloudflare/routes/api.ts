@@ -24,6 +24,9 @@ import {
   requiresManagedAccountTokens,
   supportsDirectAccountRoutingConnection,
 } from '../../server/services/accountExtraConfig.js';
+import { parseCheckinRewardAmount } from '../../server/services/checkinRewardParser.js';
+import { getLocalDayRangeUtc } from '../../server/services/localTimeService.js';
+import { estimateRewardWithTodayIncomeFallback } from '../../server/services/todayIncomeRewardService.js';
 import { getAllBrandNames, getMatchingBrandNames } from '../../server/shared/modelBrand.js';
 
 type BackupExportType = 'all' | 'accounts' | 'preferences';
@@ -7868,24 +7871,83 @@ export function registerCoreApiRoutes(app: Hono<CloudflareHonoEnv>) {
 
   app.get('/api/accounts', async (c) => {
     const db = getCloudflareDb(c);
-    const accountRows = await db
-      .select()
-      .from(schema.accounts)
-      .all();
-    const siteRows = await db
-      .select()
-      .from(schema.sites)
-      .all();
+    const { localDay, startUtc, endUtc } = getLocalDayRangeUtc();
+    const [accountRows, siteRows, todaySpendRows, todayCheckins] = await Promise.all([
+      db
+        .select()
+        .from(schema.accounts)
+        .all(),
+      db
+        .select()
+        .from(schema.sites)
+        .all(),
+      db
+        .select({
+          accountId: schema.proxyLogs.accountId,
+          totalSpend: sql<number>`coalesce(sum(${schema.proxyLogs.estimatedCost}), 0)`,
+        })
+        .from(schema.proxyLogs)
+        .where(
+          and(
+            gte(schema.proxyLogs.createdAt, startUtc),
+            lt(schema.proxyLogs.createdAt, endUtc),
+          ),
+        )
+        .groupBy(schema.proxyLogs.accountId)
+        .all(),
+      db
+        .select({
+          accountId: schema.checkinLogs.accountId,
+          reward: schema.checkinLogs.reward,
+          message: schema.checkinLogs.message,
+        })
+        .from(schema.checkinLogs)
+        .where(
+          and(
+            gte(schema.checkinLogs.createdAt, startUtc),
+            lt(schema.checkinLogs.createdAt, endUtc),
+            eq(schema.checkinLogs.status, 'success'),
+          ),
+        )
+        .all(),
+    ]);
     const siteById = new Map(siteRows.map((site) => [site.id, site]));
+    const spendByAccount: Record<number, number> = {};
+    for (const row of todaySpendRows) {
+      if (row.accountId == null) continue;
+      spendByAccount[row.accountId] = Number(row.totalSpend || 0);
+    }
+
+    const rewardByAccount: Record<number, number> = {};
+    const successCountByAccount: Record<number, number> = {};
+    const parsedRewardCountByAccount: Record<number, number> = {};
+    for (const log of todayCheckins) {
+      if (log.accountId == null) continue;
+      successCountByAccount[log.accountId] = (successCountByAccount[log.accountId] || 0) + 1;
+      const rewardNum = parseCheckinRewardAmount(log.reward) || parseCheckinRewardAmount(log.message);
+      if (rewardNum <= 0) continue;
+      rewardByAccount[log.accountId] = (rewardByAccount[log.accountId] || 0) + rewardNum;
+      parsedRewardCountByAccount[log.accountId] = (parsedRewardCountByAccount[log.accountId] || 0) + 1;
+    }
+
     const generatedAt = new Date().toISOString();
     const accounts = accountRows.map((account) => {
       const site = siteById.get(account.siteId) || null;
       const displayName = resolveCloudflareAccountDisplayName(account);
+      const todayReward = estimateRewardWithTodayIncomeFallback({
+        day: localDay,
+        successCount: successCountByAccount[account.id] || 0,
+        parsedRewardCount: parsedRewardCountByAccount[account.id] || 0,
+        rewardSum: rewardByAccount[account.id] || 0,
+        extraConfig: account.extraConfig,
+      });
       return {
         ...account,
         username: String(account.username || '').trim() || displayName || null,
         credentialMode: resolveStoredCredentialMode(account),
         capabilities: buildCapabilitiesFromCredentialMode(resolveStoredCredentialMode(account)),
+        todaySpend: toRoundedMicro(spendByAccount[account.id] || 0),
+        todayReward: toRoundedMicro(todayReward),
         runtimeHealth: buildAccountRuntimeHealthView({
           accountStatus: account.status,
           siteStatus: site?.status,
